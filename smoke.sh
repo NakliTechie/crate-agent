@@ -7,14 +7,21 @@
 # - binary --help exits cleanly
 # - every .go file under cmd/ + internal/ carries an SPDX header
 #
-# M1 gate (added when M1 lands):
+# M1 gate:
 # - Builds nakli-hub + nakli-cli from the sibling private-mesh repo
 # - Spins up a Hub on a free port, mints a real FIF via nakli-cli init
 # - Writes a crate-agent config.toml pointing at both
 # - Runs `crate-agent doctor` and asserts exit 0
-# - Tears down on exit
 #
-# Skip the M1 gate (M0-only mode) with: SKIP_M1=1 ./smoke.sh
+# M2 gate:
+# - Same Hub + Grant setup as M1
+# - POST /v1/pairing/intent with a synthetic CRATE-PAIR token
+# - Feed the token to `crate-agent pair --token-stdin --passphrase-stdin`
+# - Pair writes FIF + config, auto-runs doctor green
+# - Replay-pair surfaces the protocol's token_already_redeemed error
+#
+# Skip the M1+M2 gate (M0-only mode) with: SKIP_M1=1 ./smoke.sh
+# Skip just the M2 gate (M1-only mode) with: SKIP_M2=1 ./smoke.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -54,8 +61,6 @@ fi
 
 # --- M1 gate: doctor against a live Hub --------------------------------
 
-# Locate the sibling private-mesh repo. Default = post-reorg layout
-# (private-mesh-universe/private-mesh, sibling of crate-agent).
 private_mesh="${PRIVATE_MESH:-../private-mesh}"
 if [[ ! -d "$private_mesh/nakli-hub" || ! -d "$private_mesh/nakli-cli" ]]; then
   echo "FAIL: PRIVATE_MESH=$private_mesh does not contain nakli-hub + nakli-cli" >&2
@@ -95,7 +100,7 @@ printf 'pass-crate-agent-smoke\n' | "$tmp/nakli-cli" \
        --hub-url "$target" \
        --hub-data-dir "$hub_data" > /dev/null
 
-echo "==> Writing crate-agent config.toml"
+echo "==> Writing crate-agent config.toml (M1 doctor)"
 agent_cfg="$tmp/crate-agent.toml"
 cat > "$agent_cfg" <<EOF
 [agent]
@@ -115,8 +120,102 @@ encrypt_at_rest    = false
 EOF
 mkdir -p "$tmp/crate-folder"
 
-echo "==> Running crate-agent doctor"
+echo "==> Running crate-agent doctor (M1)"
 CRATE_AGENT_PASSPHRASE="pass-crate-agent-smoke" \
-  "$tmp/crate-agent" doctor --config "$agent_cfg"
+  "$tmp/crate-agent" doctor --config "$agent_cfg" > "$tmp/doctor.log" 2>&1
+cat "$tmp/doctor.log"
 
-echo "OK: crate-agent (M1 — wire audit + SDK binding + doctor against live Hub)"
+if [[ "${SKIP_M2:-}" == "1" ]]; then
+  echo "OK: crate-agent (M1 only — SKIP_M2=1)"
+  exit 0
+fi
+
+# --- M2 gate: pair against a live Hub ---------------------------------
+
+echo "==> Minting an identity/pair Grant for the smoke browser"
+"$tmp/nakli-cli" --config "$cli_config" grant mint \
+  --recipient "01JCRATEBROWSERPRINCIPAL0000" \
+  --primitive identity --namespace "*" --operations pair \
+  --output "$tmp/cli/identity-pair.macaroon" > /dev/null
+grant_b64=$(tr -d '\n' < "$tmp/cli/identity-pair.macaroon")
+
+echo "==> POST /v1/pairing/intent (synthetic browser issuance)"
+now_unix=$(date -u +%s)
+secret=$(python3 -c 'import secrets,base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))')
+bucket_id="01HCRATEBUCKETSMOKEXXXXXXXX"
+identity_pubkey=$(python3 -c 'import secrets,base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("="))')
+exp_unix=$((now_unix + 900))
+intent_payload=$(python3 -c "import json; print(json.dumps({'v':1,'type':'crate.pairing.token','secret':'$secret','transport_endpoint':'$target','transport_type':'hub','bucket_id':'$bucket_id','identity_pubkey':'$identity_pubkey','issued_at':$now_unix,'expires_at':$exp_unix}))")
+
+curl -fsS -X POST "${target}/v1/pairing/intent" \
+  -H "Content-Type: application/json" -H "X-Fabric-Grant: ${grant_b64}" \
+  -d "$intent_payload" > "$tmp/intent.out"
+
+echo "==> Encoding the CRATE-PAIR token from the payload"
+crate_token=$(python3 -c "
+import base64
+p = b'$intent_payload'
+print('CRATE-PAIR-' + base64.urlsafe_b64encode(p).rstrip(b'=').decode())
+")
+
+m2_cfg="$tmp/crate-agent-m2.toml"
+m2_id="$tmp/crate-agent-m2.identity"
+m2_pass="pass-crate-agent-m2"
+
+echo "==> Running crate-agent pair (--token-stdin --passphrase-stdin; auto-doctor at end)"
+printf '%s\n%s\n' "$crate_token" "$m2_pass" | "$tmp/crate-agent" pair \
+  --token-stdin --passphrase-stdin \
+  --config "$m2_cfg" \
+  --identity "$m2_id" \
+  --name "smoke-m2" \
+  --local-path "$tmp/crate-m2-folder" 2>&1 | tee "$tmp/pair.log"
+
+if [[ ! -f "$m2_cfg" ]]; then
+  echo "FAIL: pair did not write config" >&2; exit 1
+fi
+if [[ ! -f "$m2_id" ]]; then
+  echo "FAIL: pair did not write identity" >&2; exit 1
+fi
+
+# Verify file modes are 0600.
+config_mode=$(stat -f '%A' "$m2_cfg" 2>/dev/null || stat -c '%a' "$m2_cfg")
+id_mode=$(stat -f '%A' "$m2_id" 2>/dev/null || stat -c '%a' "$m2_id")
+if [[ "$config_mode" != "600" ]]; then
+  echo "FAIL: config mode is $config_mode, want 600" >&2; exit 1
+fi
+if [[ "$id_mode" != "600" ]]; then
+  echo "FAIL: identity mode is $id_mode, want 600" >&2; exit 1
+fi
+echo "  ✓ config + identity written at 0600"
+
+# Verify the encrypted capability is non-empty.
+if ! grep -q "pairing_token" "$m2_cfg" || grep -q 'pairing_token = ""' "$m2_cfg"; then
+  echo "FAIL: pair did not populate pairing_token in config" >&2; exit 1
+fi
+if ! grep -q "salt = " "$m2_cfg"; then
+  echo "FAIL: pair did not populate salt in config" >&2; exit 1
+fi
+echo "  ✓ encrypted capability + salt populated in config"
+
+echo "==> Replay-pair (same token → expect token_already_redeemed → exit 1)"
+set +e
+# Use a pipe rather than tee so $? captures crate-agent's status, not tee's.
+printf '%s\n%s\n' "$crate_token" "$m2_pass" > "$tmp/replay-input.txt"
+"$tmp/crate-agent" pair \
+  --token-stdin --passphrase-stdin \
+  --config "$tmp/crate-agent-m2-replay.toml" \
+  --identity "$tmp/crate-agent-m2-replay.identity" \
+  < "$tmp/replay-input.txt" \
+  > "$tmp/pair-replay.log" 2>&1
+replay_status=$?
+set -e
+cat "$tmp/pair-replay.log"
+if [[ "$replay_status" != "1" ]]; then
+  echo "FAIL: replay-pair exit $replay_status, want 1 (generic — Hub rejected with token_already_redeemed)" >&2; exit 1
+fi
+if ! grep -qi "already redeem" "$tmp/pair-replay.log"; then
+  echo "FAIL: replay-pair did not surface 'already redeemed' recovery message" >&2; exit 1
+fi
+echo "  ✓ replay exits 1 with token_already_redeemed message"
+
+echo "OK: crate-agent (M2 — pair command end-to-end + auto-doctor)"

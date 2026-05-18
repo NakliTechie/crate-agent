@@ -40,14 +40,24 @@ type IdentitySection struct {
 
 // CrateSection describes the single folder being synced (v1.0 is one-folder;
 // v1.3 makes this an array).
+//
+// Capability storage (M2): PairingToken holds the daemon's capability
+// macaroon encrypted under the master key derived from the user's
+// passphrase. Salt + CapabilityNonce travel alongside so a later daemon
+// run can re-derive the master key + decrypt the capability without
+// re-pairing.
 type CrateSection struct {
 	Name              string `toml:"name"`
 	LocalPath         string `toml:"local_path"`
 	TransportEndpoint string `toml:"transport_endpoint"`
 	TransportType     string `toml:"transport_type"`  // cf-worker | hub | managed
-	PairingToken      string `toml:"pairing_token"`   // encrypted blob, opaque
+	PairingToken      string `toml:"pairing_token"`   // base64(XChaCha20-Poly1305(capability_bytes, master_key, nonce))
 	BucketID          string `toml:"bucket_id"`
 	EncryptAtRest     bool   `toml:"encrypt_at_rest"`
+	Salt              string `toml:"salt,omitempty"`              // base64, written by `pair`
+	CapabilityNonce   string `toml:"capability_nonce,omitempty"`  // base64, written by `pair`
+	TransportPubkey   string `toml:"transport_pubkey,omitempty"`  // base64, written by `pair`
+	CapabilityExpires int64  `toml:"capability_expires,omitempty"` // unix seconds
 }
 
 // Defaults supplies sensible values for optional fields. Callers merge

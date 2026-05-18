@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -32,8 +33,8 @@ var doctorCmd = &cobra.Command{
 	Long: `Run a series of checks: config validity, identity key present
 and readable, transport reachable, state.db readable, watcher functional.
 
-M1: the first three checks are real. State + watcher are stubbed and
-marked deferred until M2 (state) and M3 (watcher).
+M2: the first three checks are real. State + watcher are stubbed and
+marked deferred until M3 (state) and M3 (watcher).
 
 Exit codes: 0 = all pass; 1 = generic; 2 = config; 3 = transport.`,
 	RunE: runDoctor,
@@ -41,7 +42,7 @@ Exit codes: 0 = all pass; 1 = generic; 2 = config; 3 = transport.`,
 
 func init() {
 	doctorCmd.Flags().StringP("config", "c", "", "Path to crate-agent.toml (default: ~/.config/nakli/crate-agent.toml)")
-	doctorCmd.Flags().String("passphrase-env", "CRATE_AGENT_PASSPHRASE", "Env var holding the FIF passphrase (no interactive prompt at M1)")
+	doctorCmd.Flags().String("passphrase-env", "CRATE_AGENT_PASSPHRASE", "Env var holding the FIF passphrase (cobra entry; pair invokes RunChecks directly)")
 	doctorCmd.Flags().Bool("json", false, "Machine-readable output (M2+)")
 }
 
@@ -55,66 +56,118 @@ func runDoctor(cmd *cobra.Command, _ []string) error {
 		}
 		cfgPath = home + "/.config/nakli/crate-agent.toml"
 	}
+	passEnv, _ := cmd.Flags().GetString("passphrase-env")
+	pass := os.Getenv(passEnv)
+	if err := RunChecks(cmd.Context(), os.Stdout, os.Stderr, cfgPath, pass); err != nil {
+		code := exitCodeFor(err)
+		return exitErr(code, err)
+	}
+	return nil
+}
+
+// RunChecks executes the three real checks (config / identity / transport)
+// + the two stubs (state / watcher). Returns a typed error so callers can
+// map it to a specific exit code via exitCodeFor. Used by `crate-agent
+// doctor` standalone AND by `crate-agent pair`'s auto-doctor step.
+//
+// Output is written to `stdout` for ✓/⚠ lines and `stderr` for ✗ failures.
+// Passing nil for either writer suppresses that stream.
+func RunChecks(ctx context.Context, stdout, stderr io.Writer, cfgPath, passphrase string) error {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
 
 	// Check 1 — config validity.
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "✗ Config:", err)
-		return exitErr(exitConfigError, err)
+		fmt.Fprintln(stderr, "✗ Config:", err)
+		return &checkErr{kind: checkConfig, err: err}
 	}
 	if err := cfg.Validate(); err != nil {
-		fmt.Fprintln(os.Stderr, "✗ Config:", err)
-		return exitErr(exitConfigError, err)
+		fmt.Fprintln(stderr, "✗ Config:", err)
+		return &checkErr{kind: checkConfig, err: err}
 	}
-	fmt.Println("✓ Config valid")
+	fmt.Fprintln(stdout, "✓ Config valid")
 
 	// Check 2 — identity present + readable + unlockable.
-	passEnv, _ := cmd.Flags().GetString("passphrase-env")
-	pass := os.Getenv(passEnv)
-	if pass == "" {
-		err := fmt.Errorf("identity: %s env var is empty; set it to the FIF passphrase", passEnv)
-		fmt.Fprintln(os.Stderr, "✗ Identity:", err)
-		return exitErr(exitGeneric, err)
+	if passphrase == "" {
+		err := errors.New("identity: passphrase is empty; set CRATE_AGENT_PASSPHRASE or pass via pair's in-process call")
+		fmt.Fprintln(stderr, "✗ Identity:", err)
+		return &checkErr{kind: checkGeneric, err: err}
 	}
-	fif, err := identity.Load(cfg.Identity.Path, pass)
+	fif, err := identity.Load(cfg.Identity.Path, passphrase)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "✗ Identity:", err)
-		return exitErr(exitGeneric, err)
+		fmt.Fprintln(stderr, "✗ Identity:", err)
+		return &checkErr{kind: checkGeneric, err: err}
 	}
-	_ = fif // M1 just verifies unlocking succeeded; further use comes at M2+
-	fmt.Println("✓ Identity loaded + unlocked")
+	_ = fif // verifying unlock succeeded is enough at M2; M3+ uses it for sync
+	fmt.Fprintln(stdout, "✓ Identity loaded + unlocked")
 
 	// Check 3 — transport reachable.
-	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	client := httpc.New(cfg.Crate.TransportEndpoint)
-	resp, err := client.Health(ctx)
+	resp, err := client.Health(timeoutCtx)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "✗ Transport:", err)
-		return exitErr(exitTransportDown, err)
+		fmt.Fprintln(stderr, "✗ Transport:", err)
+		return &checkErr{kind: checkTransport, err: err}
 	}
 	if resp.Status < 200 || resp.Status >= 300 {
 		err := fmt.Errorf("transport returned HTTP %d", resp.Status)
 		if resp.Envelope.Error != nil {
 			err = fmt.Errorf("transport returned HTTP %d: %s (%s)", resp.Status, resp.Envelope.Error.Code, resp.Envelope.Error.Message)
 		}
-		fmt.Fprintln(os.Stderr, "✗ Transport:", err)
-		return exitErr(exitTransportDown, err)
+		fmt.Fprintln(stderr, "✗ Transport:", err)
+		return &checkErr{kind: checkTransport, err: err}
 	}
 	if !resp.Envelope.OK {
 		err := errors.New("transport responded but envelope ok=false")
-		fmt.Fprintln(os.Stderr, "✗ Transport:", err)
-		return exitErr(exitTransportDown, err)
+		fmt.Fprintln(stderr, "✗ Transport:", err)
+		return &checkErr{kind: checkTransport, err: err}
 	}
-	fmt.Printf("✓ Transport reachable (%s, HTTP %d)\n", cfg.Crate.TransportEndpoint, resp.Status)
+	fmt.Fprintf(stdout, "✓ Transport reachable (%s, HTTP %d)\n", cfg.Crate.TransportEndpoint, resp.Status)
 
-	// Check 4 — state.db (deferred; M2+).
-	fmt.Println("⚠ State DB: deferred to M2 (no daemon state at M1)")
+	// Check 4 — state.db (deferred; M3+).
+	fmt.Fprintln(stdout, "⚠ State DB: deferred to M3 (no daemon state at M2)")
 
 	// Check 5 — watcher (deferred; M3+).
-	fmt.Println("⚠ Watcher: deferred to M3 (no daemon loop at M1)")
+	fmt.Fprintln(stdout, "⚠ Watcher: deferred to M3 (no daemon loop at M2)")
 
 	return nil
+}
+
+// --- typed check error -------------------------------------------------
+
+type checkKind int
+
+const (
+	checkGeneric checkKind = iota
+	checkConfig
+	checkTransport
+)
+
+type checkErr struct {
+	kind checkKind
+	err  error
+}
+
+func (e *checkErr) Error() string { return e.err.Error() }
+func (e *checkErr) Unwrap() error { return e.err }
+
+func exitCodeFor(err error) int {
+	var ce *checkErr
+	if errors.As(err, &ce) {
+		switch ce.kind {
+		case checkConfig:
+			return exitConfigError
+		case checkTransport:
+			return exitTransportDown
+		}
+	}
+	return exitGeneric
 }
 
 // exitErr lets RunE return both an error (so cobra surfaces a non-zero

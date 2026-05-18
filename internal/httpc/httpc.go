@@ -4,13 +4,14 @@
 // (docs/wire-protocol-audit.md §3), fabric-sdk-go has no top-level
 // Transport/Client type; the daemon brings its own thin wrapper.
 //
-// M1 scope: `GET /fabric/v1/health` only (unauthenticated). M2 grows this
-// to carry the daemon's capability macaroon in `X-Fabric-Grant` and to
-// POST envelopes per fabric-spec-001.
+// M1 scope: `GET /fabric/v1/health` only (unauthenticated). M2 adds
+// `POST /v1/pairing/redeem` (unauthenticated POST JSON). M3+ will add
+// macaroon-bearing methods via `X-Fabric-Grant`.
 
 package httpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -74,6 +75,26 @@ func (c *Client) get(ctx context.Context, path string) (*Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build request %s: %w", path, err)
 	}
+	return c.do(req, path)
+}
+
+// PostJSON marshals `body` as JSON and POSTs to `path`. Same envelope-
+// parsing semantics as `Health`: returns (resp, nil) for any completed
+// HTTP exchange, (nil, err) only for transport-level failures.
+func (c *Client) PostJSON(ctx context.Context, path string, body interface{}) (*Response, error) {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("httpc: marshal %s: %w", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+path, bytes.NewReader(buf))
+	if err != nil {
+		return nil, fmt.Errorf("httpc: build request %s: %w", path, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return c.do(req, path)
+}
+
+func (c *Client) do(req *http.Request, path string) (*Response, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("httpc: do %s: %w", path, err)
