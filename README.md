@@ -6,7 +6,7 @@ Build target: single statically-linked Go binary per OS. v1.0 ships macOS + Linu
 
 ## Status
 
-**M0** — skeleton. The pairing flow lands at M2; one-direction upload at M3; bidirectional sync at M4. See [`crate-daemon-handoff-v1.0.md`](../private-mesh/docs/specs/crate-daemon-handoff-v1.0.md) (in the sibling `private-mesh` repo) for the full milestone plan and [`crate-pairing-protocol-v1.0.md`](../private-mesh/docs/specs/crate-pairing-protocol-v1.0.md) for the cross-surface contract.
+**M0** — skeleton. The pairing flow lands at M2; one-direction upload at M3; bidirectional sync at M4. See [`docs/specs/crate-daemon-handoff-v1.0.md`](docs/specs/crate-daemon-handoff-v1.0.md) for the full milestone plan and [`crate-pairing-protocol-v1.0.md`](../private-mesh/docs/specs/crate-pairing-protocol-v1.0.md) (in the sibling `private-mesh` repo) for the cross-surface contract. The vision doc lives in `private-mesh` too: [`crate-vision-and-roadmap-v1.0.md`](../private-mesh/docs/specs/crate-vision-and-roadmap-v1.0.md).
 
 ## Build
 
