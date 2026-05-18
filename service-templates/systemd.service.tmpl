@@ -1,0 +1,15 @@
+[Unit]
+Description=Crate Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{.BinaryPath}} start
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:{{.LogPath}}
+StandardError=append:{{.LogPath}}
+
+[Install]
+WantedBy=default.target
