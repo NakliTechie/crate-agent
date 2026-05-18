@@ -1,2 +1,11 @@
 dist/
 *.test
+
+# Local working notes (mirrors private-mesh + crate convention).
+/plan/
+
+# OS noise
+.DS_Store
+
+# Editor noise
+*.swp
