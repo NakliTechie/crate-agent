@@ -24,6 +24,7 @@ import (
 	"github.com/NakliTechie/crate-agent/internal/httpc"
 	"github.com/NakliTechie/crate-agent/internal/kdf"
 	"github.com/NakliTechie/crate-agent/internal/pidfile"
+	"github.com/NakliTechie/crate-agent/internal/puller"
 	"github.com/NakliTechie/crate-agent/internal/refresh"
 	"github.com/NakliTechie/crate-agent/internal/state"
 	"github.com/NakliTechie/crate-agent/internal/syncer"
@@ -240,6 +241,19 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		return exitErr(exitGeneric, err)
 	}
 
+	// --- Pull loop (M3 piece 5b) -----------------------------------------
+	pul, err := puller.New(puller.Config{
+		LocalPath:     cfg.Crate.LocalPath,
+		BucketID:      cfg.Crate.BucketID,
+		CapabilityRef: &liveCapability,
+		Hub:           client,
+		State:         store,
+		Logger:        slog.Default(),
+	})
+	if err != nil {
+		return exitErr(exitGeneric, err)
+	}
+
 	// --- Signal handling -------------------------------------------------
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
@@ -261,10 +275,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	fmt.Println("  (Send SIGTERM or Ctrl-C to stop.)")
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() { defer wg.Done(); _ = w.Run(ctx) }()
 	go func() { defer wg.Done(); _ = syn.Run(ctx) }()
 	go func() { defer wg.Done(); ref.Run(ctx) }()
+	go func() { defer wg.Done(); pul.Run(ctx) }()
 	wg.Wait()
 
 	fmt.Println("✓ stopped cleanly")
