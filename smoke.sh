@@ -20,6 +20,14 @@
 # - Pair writes FIF + config, auto-runs doctor green
 # - Replay-pair surfaces the protocol's token_already_redeemed error
 #
+# M3 (piece 2 — daemon state + watcher) gate:
+# - The doctor invocation in the M1 + M2 paths now exercises the SQLite
+#   state DB (opens, migrates, queries) + watcher (constructs fsnotify
+#   handle, loads .crateignore, walks local_path) for real.
+# - We assert the doctor log contains the new "State DB ready" + "Watcher
+#   operational" success markers — proving the M3 piece-2 checks are wired
+#   and that doctor hasn't regressed to the M2 deferred-stub messages.
+#
 # Skip the M1+M2 gate (M0-only mode) with: SKIP_M1=1 ./smoke.sh
 # Skip just the M2 gate (M1-only mode) with: SKIP_M2=1 ./smoke.sh
 set -euo pipefail
@@ -120,10 +128,33 @@ encrypt_at_rest    = false
 EOF
 mkdir -p "$tmp/crate-folder"
 
-echo "==> Running crate-agent doctor (M1)"
+echo "==> Running crate-agent doctor (M1 + M3 piece 2 — state DB + watcher real)"
 CRATE_AGENT_PASSPHRASE="pass-crate-agent-smoke" \
   "$tmp/crate-agent" doctor --config "$agent_cfg" > "$tmp/doctor.log" 2>&1
 cat "$tmp/doctor.log"
+
+# M3 piece-2 assertions: doctor's state + watcher checks must be REAL,
+# not the M2 deferred-stub messages.
+if grep -q "deferred to M3" "$tmp/doctor.log"; then
+  echo "FAIL: doctor still emits 'deferred to M3' — state/watcher checks regressed" >&2
+  exit 1
+fi
+if ! grep -q "State DB ready" "$tmp/doctor.log"; then
+  echo "FAIL: doctor did not emit 'State DB ready' — M3 piece 2 regression" >&2
+  exit 1
+fi
+if ! grep -q "Watcher operational" "$tmp/doctor.log"; then
+  echo "FAIL: doctor did not emit 'Watcher operational' — M3 piece 2 regression" >&2
+  exit 1
+fi
+echo "  ✓ doctor exercises state DB + watcher (M3 piece 2)"
+
+# The state DB should now exist on disk under <local_path>/.crate/state.db.
+if [[ ! -f "$tmp/crate-folder/.crate/state.db" ]]; then
+  echo "FAIL: state.db was not created at expected path" >&2
+  exit 1
+fi
+echo "  ✓ state.db created at <local_path>/.crate/state.db"
 
 if [[ "${SKIP_M2:-}" == "1" ]]; then
   echo "OK: crate-agent (M1 only — SKIP_M2=1)"

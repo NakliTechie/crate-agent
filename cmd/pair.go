@@ -25,6 +25,7 @@ import (
 	"github.com/NakliTechie/crate-agent/internal/identity"
 	"github.com/NakliTechie/crate-agent/internal/kdf"
 	"github.com/NakliTechie/crate-agent/internal/pairing"
+	"github.com/NakliTechie/crate-agent/internal/state"
 )
 
 var pairCmd = &cobra.Command{
@@ -171,11 +172,14 @@ func runPair(cmd *cobra.Command, _ []string) error {
 	}
 
 	// --- Step 8: write config ----------------------------------------
+	// State DB lives inside the crate folder by default (state.DefaultPath);
+	// removing the crate folder also removes the daemon's local state. The
+	// user can override via agent.state_db in the config.
 	cfg := &config.Config{
 		Agent: config.AgentSection{
 			LogLevel: "info",
 			LogPath:  filepath.Join(home, ".local/share/nakli/crate-agent.log"),
-			StateDB:  filepath.Join(home, ".local/share/nakli/crate-agent.db"),
+			StateDB:  state.DefaultPath(localPath),
 		},
 		Identity: config.IdentitySection{Path: idPath},
 		Crate: config.CrateSection{

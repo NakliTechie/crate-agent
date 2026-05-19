@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -14,6 +15,8 @@ import (
 	"github.com/NakliTechie/crate-agent/internal/config"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
 	"github.com/NakliTechie/crate-agent/internal/identity"
+	"github.com/NakliTechie/crate-agent/internal/state"
+	"github.com/NakliTechie/crate-agent/internal/watcher"
 )
 
 // Exit codes per crate-daemon-handoff-v1.0.md §"CLI commands":
@@ -33,8 +36,10 @@ var doctorCmd = &cobra.Command{
 	Long: `Run a series of checks: config validity, identity key present
 and readable, transport reachable, state.db readable, watcher functional.
 
-M2: the first three checks are real. State + watcher are stubbed and
-marked deferred until M3 (state) and M3 (watcher).
+M3: all five checks real. State DB opens the local SQLite at agent.state_db
+(default: <local_path>/.crate/state.db) and runs migrations + a pending-uploads
+query. Watcher verifies fsnotify + the .crateignore parse + that local_path is
+watchable.
 
 Exit codes: 0 = all pass; 1 = generic; 2 = config; 3 = transport.`,
 	RunE: runDoctor,
@@ -130,11 +135,50 @@ func RunChecks(ctx context.Context, stdout, stderr io.Writer, cfgPath, passphras
 	}
 	fmt.Fprintf(stdout, "✓ Transport reachable (%s, HTTP %d)\n", cfg.Crate.TransportEndpoint, resp.Status)
 
-	// Check 4 — state.db (deferred; M3+).
-	fmt.Fprintln(stdout, "⚠ State DB: deferred to M3 (no daemon state at M2)")
+	// Check 4 — state.db (M3+).
+	statePath := cfg.Agent.StateDB
+	if statePath == "" {
+		statePath = state.DefaultPath(cfg.Crate.LocalPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+		fmt.Fprintln(stderr, "✗ State DB:", err)
+		return &checkErr{kind: checkGeneric, err: err}
+	}
+	store, err := state.Open(statePath)
+	if err != nil {
+		fmt.Fprintln(stderr, "✗ State DB:", err)
+		return &checkErr{kind: checkGeneric, err: err}
+	}
+	defer store.Close()
+	if pending, err := store.PendingUploadCount(ctx); err != nil {
+		fmt.Fprintln(stderr, "✗ State DB query:", err)
+		return &checkErr{kind: checkGeneric, err: err}
+	} else {
+		fmt.Fprintf(stdout, "✓ State DB ready (%s, %d pending uploads)\n", statePath, pending)
+	}
 
-	// Check 5 — watcher (deferred; M3+).
-	fmt.Fprintln(stdout, "⚠ Watcher: deferred to M3 (no daemon loop at M2)")
+	// Check 5 — watcher (M3+). Verifies fsnotify + .crateignore parse + the
+	// crate root is watchable. We construct + immediately close — actually
+	// running the watcher is a job for `start`.
+	if cfg.Crate.LocalPath == "" {
+		fmt.Fprintln(stderr, "✗ Watcher: crate.local_path is empty")
+		return &checkErr{kind: checkConfig, err: errors.New("crate.local_path is empty")}
+	}
+	if err := os.MkdirAll(cfg.Crate.LocalPath, 0o700); err != nil {
+		fmt.Fprintln(stderr, "✗ Watcher: cannot create local_path:", err)
+		return &checkErr{kind: checkGeneric, err: err}
+	}
+	ignorePath := filepath.Join(cfg.Crate.LocalPath, ".crateignore")
+	w, err := watcher.New(watcher.Options{
+		Root:       cfg.Crate.LocalPath,
+		IgnoreFile: ignorePath,
+	})
+	if err != nil {
+		fmt.Fprintln(stderr, "✗ Watcher:", err)
+		return &checkErr{kind: checkGeneric, err: err}
+	}
+	_ = w.Close()
+	fmt.Fprintf(stdout, "✓ Watcher operational (root: %s)\n", cfg.Crate.LocalPath)
 
 	return nil
 }
