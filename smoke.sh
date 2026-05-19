@@ -340,4 +340,66 @@ echo "$json_out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d
   || { echo "FAIL: --json shape rejected" >&2; exit 1; }
 echo "  ✓ --json parses + bucket_id present"
 
-echo "OK: crate-agent (M2 + M3 pieces 6+8 — start/stop/status round-trip)"
+# --- M3 piece 10 gate: install-service / uninstall-service --------------
+#
+# Redirects HOME + XDG_CONFIG_HOME into the temp dir so the test doesn't
+# touch the user's real ~/Library/LaunchAgents/ or ~/.config/systemd/user/.
+
+echo "==> install-service (under fake HOME)"
+fake_home="$tmp/fake-home"
+mkdir -p "$fake_home"
+HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+  "$tmp/crate-agent" install-service --config "$m2_cfg" --label "com.smoke.crate-agent" \
+  > "$tmp/install.log" 2>&1
+cat "$tmp/install.log"
+
+# Confirm the file landed at the expected path.
+os=$(uname -s)
+if [[ "$os" == "Darwin" ]]; then
+  unit_path="$fake_home/Library/LaunchAgents/com.smoke.crate-agent.plist"
+elif [[ "$os" == "Linux" ]]; then
+  unit_path="$fake_home/.config/systemd/user/com.smoke.crate-agent.service"
+else
+  echo "  (skipping unit-file existence check on $os)"
+  unit_path=""
+fi
+if [[ -n "$unit_path" ]]; then
+  if [[ ! -f "$unit_path" ]]; then
+    echo "FAIL: install-service did not write $unit_path" >&2
+    exit 1
+  fi
+  echo "  ✓ unit file at $unit_path"
+  # Sanity-check the unit body references the daemon binary + config path.
+  if ! grep -q "$tmp/crate-agent" "$unit_path"; then
+    echo "FAIL: unit does not reference daemon binary path" >&2
+    exit 1
+  fi
+  if ! grep -q "$m2_cfg" "$unit_path"; then
+    echo "FAIL: unit does not reference config path" >&2
+    exit 1
+  fi
+  echo "  ✓ unit references binary + config"
+fi
+
+echo "==> uninstall-service"
+HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+  "$tmp/crate-agent" uninstall-service --label "com.smoke.crate-agent" \
+  > "$tmp/uninstall.log" 2>&1
+cat "$tmp/uninstall.log"
+if [[ -n "$unit_path" && -f "$unit_path" ]]; then
+  echo "FAIL: uninstall-service did not remove $unit_path" >&2
+  exit 1
+fi
+echo "  ✓ unit file removed"
+
+# Second uninstall reports "already absent" with exit 0.
+HOME="$fake_home" XDG_CONFIG_HOME="$fake_home/.config" \
+  "$tmp/crate-agent" uninstall-service --label "com.smoke.crate-agent" \
+  > "$tmp/uninstall2.log" 2>&1
+if ! grep -qi "already absent" "$tmp/uninstall2.log"; then
+  echo "FAIL: second uninstall did not report 'already absent'" >&2
+  exit 1
+fi
+echo "  ✓ second uninstall reports already-absent"
+
+echo "OK: crate-agent (M2 + M3 pieces 6 + 7 + 8 + 10 — install-service round-trip)"
