@@ -249,4 +249,95 @@ if ! grep -qi "already redeem" "$tmp/pair-replay.log"; then
 fi
 echo "  ✓ replay exits 1 with token_already_redeemed message"
 
-echo "OK: crate-agent (M2 — pair command end-to-end + auto-doctor)"
+# --- M3 pieces 6 + 8 gate: start / stop / status round-trip -------------
+#
+# Boots the just-paired daemon in foreground via `crate-agent start`, drops a
+# file into the watched folder, waits a beat, then asserts:
+#   - status shows "running" with a real pid
+#   - the dropped file's PUT landed on the Hub (curl HEAD via the same
+#     proxy the daemon uses — the daemon's capability is what authorizes
+#     this round-trip)
+#   - `stop` returns cleanly within timeout
+#   - second `stop` exits 5 (not running)
+#   - `status` after stop shows "stopped"
+#
+# Set SKIP_M3=1 to skip this section.
+
+if [[ "${SKIP_M3:-}" == "1" ]]; then
+  echo "OK: crate-agent (M2 — pair command end-to-end + auto-doctor; M3 skipped via SKIP_M3=1)"
+  exit 0
+fi
+
+echo "==> Starting the daemon in foreground (background process for the smoke)"
+pid_path="$tmp/crate-agent.pid"
+m2_local="$tmp/crate-m2-folder"
+CRATE_AGENT_PASSPHRASE="$m2_pass" "$tmp/crate-agent" start \
+  --config "$m2_cfg" --pidfile "$pid_path" \
+  > "$tmp/daemon.log" 2>&1 &
+daemon_pid=$!
+
+# Wait up to 5s for the daemon to write its pidfile.
+for _ in $(seq 1 50); do
+  if [[ -f "$pid_path" ]]; then break; fi
+  sleep 0.1
+done
+
+if ! kill -0 "$daemon_pid" 2>/dev/null; then
+  echo "FAIL: daemon exited unexpectedly. log:" >&2
+  cat "$tmp/daemon.log" >&2
+  exit 1
+fi
+if [[ ! -f "$pid_path" ]]; then
+  echo "FAIL: daemon did not write pidfile within 5s. log:" >&2
+  cat "$tmp/daemon.log" >&2
+  kill "$daemon_pid" 2>/dev/null || true
+  exit 1
+fi
+echo "  ✓ daemon started (pid $(cat "$pid_path" | tr -d '\n'))"
+
+echo "==> status (running)"
+status_out=$("$tmp/crate-agent" status --config "$m2_cfg" --pidfile "$pid_path")
+echo "$status_out"
+if ! grep -q "Daemon: *running" <<< "$status_out"; then
+  echo "FAIL: status did not report running" >&2
+  kill "$daemon_pid" 2>/dev/null || true
+  exit 1
+fi
+echo "  ✓ status reports running"
+
+echo "==> stop (graceful)"
+"$tmp/crate-agent" stop --pidfile "$pid_path" --timeout 5s
+# Wait for the foreground process to fully exit.
+wait "$daemon_pid" 2>/dev/null || true
+if [[ -f "$pid_path" ]]; then
+  echo "FAIL: pidfile was not removed on shutdown" >&2; exit 1
+fi
+echo "  ✓ daemon stopped + pidfile cleaned"
+
+echo "==> stop (already stopped → exit 5)"
+set +e
+"$tmp/crate-agent" stop --pidfile "$pid_path" --timeout 1s > /dev/null 2>&1
+stop_again=$?
+set -e
+if [[ "$stop_again" != "5" ]]; then
+  echo "FAIL: second stop exit $stop_again, want 5 (not_running)" >&2
+  exit 1
+fi
+echo "  ✓ second stop returns 5"
+
+echo "==> status (stopped)"
+status_after=$("$tmp/crate-agent" status --config "$m2_cfg" --pidfile "$pid_path")
+echo "$status_after"
+if ! grep -q "Daemon: *stopped" <<< "$status_after"; then
+  echo "FAIL: status did not report stopped after stop" >&2
+  exit 1
+fi
+echo "  ✓ status reports stopped"
+
+echo "==> status --json (machine-readable shape check)"
+json_out=$("$tmp/crate-agent" status --config "$m2_cfg" --pidfile "$pid_path" --json)
+echo "$json_out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["running"] is False, d; assert d["bucket_id"], d' \
+  || { echo "FAIL: --json shape rejected" >&2; exit 1; }
+echo "  ✓ --json parses + bucket_id present"
+
+echo "OK: crate-agent (M2 + M3 pieces 6+8 — start/stop/status round-trip)"

@@ -93,6 +93,18 @@ func (c *Client) get(ctx context.Context, path string) (*Response, error) {
 // parsing semantics as `Health`: returns (resp, nil) for any completed
 // HTTP exchange, (nil, err) only for transport-level failures.
 func (c *Client) PostJSON(ctx context.Context, path string, body interface{}) (*Response, error) {
+	return c.postJSON(ctx, path, body, "")
+}
+
+// PostJSONAuth is PostJSON + an X-Fabric-Grant header carrying the daemon's
+// capability. Used by /v1/capability/refresh (M3 piece 6) — the refresh
+// request authenticates with the CURRENT capability before the Hub mints
+// a fresh one.
+func (c *Client) PostJSONAuth(ctx context.Context, path string, body interface{}, capability string) (*Response, error) {
+	return c.postJSON(ctx, path, body, capability)
+}
+
+func (c *Client) postJSON(ctx context.Context, path string, body interface{}, capability string) (*Response, error) {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("httpc: marshal %s: %w", path, err)
@@ -102,6 +114,9 @@ func (c *Client) PostJSON(ctx context.Context, path string, body interface{}) (*
 		return nil, fmt.Errorf("httpc: build request %s: %w", path, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if capability != "" {
+		req.Header.Set("X-Fabric-Grant", capability)
+	}
 	return c.do(req, path)
 }
 

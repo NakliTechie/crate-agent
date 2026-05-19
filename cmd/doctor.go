@@ -28,6 +28,8 @@ const (
 	exitGeneric         = 1
 	exitConfigError     = 2
 	exitTransportDown   = 3
+	exitAlreadyRunning  = 4
+	exitNotRunning      = 5
 )
 
 var doctorCmd = &cobra.Command{
