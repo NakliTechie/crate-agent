@@ -282,20 +282,22 @@ func TestSyncer_DeleteOnRemove(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
+	// Wait until BOTH the Hub copy is gone AND the manifest_cache row is
+	// removed. The two updates happen in sequence inside the worker
+	// goroutine (Hub DELETE → DeleteManifestEntry); separate predicates
+	// would race.
 	deleted := waitFor(t, 3*time.Second, func() bool {
-		_, ok := r.hub.get("doomed.txt")
-		return !ok
+		if _, ok := r.hub.get("doomed.txt"); ok {
+			return false
+		}
+		m, err := r.state.LookupManifestEntry(context.Background(), "doomed.txt")
+		if err != nil {
+			return false
+		}
+		return m == nil
 	})
 	if !deleted {
-		t.Fatal("DELETE didn't propagate to the hub")
-	}
-	// manifest_cache row should be gone too.
-	m, err := r.state.LookupManifestEntry(context.Background(), "doomed.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m != nil {
-		t.Errorf("manifest_cache row still present after delete: %+v", m)
+		t.Fatal("DELETE+manifest-clear didn't complete within 3s")
 	}
 }
 
@@ -308,18 +310,23 @@ func TestSyncer_RetriesOnFailure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(r.localPath, "retry.txt"), payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Wait for the file to land at the Hub AND the upload_queue row to be
+	// marked completed. The two updates happen in sequence inside the
+	// worker goroutine (Hub PUT → MarkUploadAttempt success), so checking
+	// the queue depth separately would race.
 	ok := waitFor(t, 5*time.Second, func() bool {
 		b, ok := r.hub.get("retry.txt")
-		return ok && string(b) == string(payload)
+		if !ok || string(b) != string(payload) {
+			return false
+		}
+		n, err := r.state.PendingUploadCount(context.Background())
+		return err == nil && n == 0
 	})
 	if !ok {
-		t.Fatalf("retry.txt never landed; puts=%d", r.hub.puts.Load())
+		t.Fatalf("retry.txt never landed cleanly; puts=%d", r.hub.puts.Load())
 	}
 	if r.hub.puts.Load() < 3 {
 		t.Errorf("expected ≥3 PUTs (2 failures + 1 success); got %d", r.hub.puts.Load())
-	}
-	if n, _ := r.state.PendingUploadCount(context.Background()); n != 0 {
-		t.Errorf("pending count = %d after eventual success; want 0", n)
 	}
 }
 

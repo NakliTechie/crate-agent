@@ -13,12 +13,14 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	sdkcrypto "github.com/NakliTechie/private-mesh/fabric-sdk-go/crypto"
 
 	"github.com/NakliTechie/crate-agent/internal/config"
+	"github.com/NakliTechie/crate-agent/internal/cratejson"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
 	"github.com/NakliTechie/crate-agent/internal/kdf"
 	"github.com/NakliTechie/crate-agent/internal/pidfile"
@@ -125,7 +127,11 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		return exitErr(exitConfigError, fmt.Errorf("pairing_token b64: %w", err))
 	}
 	masterKey := kdf.DeriveMasterKey(passphrase, salt)
-	passphrase = "" // drop the reference
+	// Keep the passphrase reachable for the reconciliation step below
+	// (re-derive master key if the canonical salt differs from local).
+	// Cleared after reconciliation completes.
+	passphraseForReconcile := passphrase
+	passphrase = "" // drop the early-pipeline reference
 
 	capabilityBytes, err := sdkcrypto.Open(masterKey, nonce, sealed, nil)
 	if err != nil {
@@ -138,7 +144,6 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// liveCapability is the base64-encoded macaroon the syncer presents on
 	// every Hub request. refresh.Runner updates this in-place on success.
 	liveCapability := base64.StdEncoding.EncodeToString(capabilityBytes)
-	zeroBytes(capabilityBytes)
 	// masterKey stays in memory for the daemon's lifetime so refresh can
 	// re-encrypt without re-prompting; zeroed on shutdown.
 	defer zeroBytes(masterKey)
@@ -173,6 +178,40 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// --- HTTP client -----------------------------------------------------
 	client := httpc.New(cfg.Crate.TransportEndpoint)
+
+	// --- Salt reconciliation (M3 piece 7) --------------------------------
+	// Forward-compatible: the browser may not have written .crate/crate.json
+	// yet, in which case the reconciler returns ActionAbsent and the daemon
+	// proceeds with its local salt. When the browser DOES write the file,
+	// the next start aligns the master key with the canonical salt.
+	{
+		reconCtx, reconCancel := context.WithTimeout(cmd.Context(), 30*time.Second)
+		res := cratejson.Reconcile(reconCtx, cratejson.ReconcileInput{
+			CfgPath:          cfgPath,
+			Cfg:              cfg,
+			Passphrase:       passphraseForReconcile,
+			CurrentMasterKey: masterKey,
+			CapabilityBytes:  capabilityBytes,
+			Hub:              client,
+			Capability:       liveCapability,
+			Logger:           slog.Default(),
+		})
+		reconCancel()
+		switch res.Action {
+		case cratejson.ActionReconciled:
+			// Swap in the new master key; zero the old one.
+			zeroBytes(masterKey)
+			masterKey = res.NewMasterKey
+			slog.Info("master key re-derived from canonical salt")
+		case cratejson.ActionAbsent, cratejson.ActionAlreadyCanonical, cratejson.ActionFailed:
+			// Nothing to do.
+		}
+	}
+	// Now that reconciliation is done, the plaintext capability + passphrase
+	// can be wiped — the syncer holds the base64-encoded liveCapability for
+	// future Hub calls, and the refresh runner re-encrypts via masterKey.
+	zeroBytes(capabilityBytes)
+	passphraseForReconcile = ""
 
 	// --- Sync loop -------------------------------------------------------
 	syn, err := syncer.New(syncer.Config{
