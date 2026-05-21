@@ -1,0 +1,54 @@
+name: release
+
+# Cross-compiles the four target binaries on every v-prefixed tag push
+# and attaches them to the matching GitHub Release. The README's
+# `curl -L .../releases/latest/download/crate-agent-darwin-arm64`
+# pattern resolves against these uploads.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required to create + upload to releases
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Cross-compile (darwin + linux × amd64 + arm64)
+        run: |
+          # VERSION embeds the tag into the binary via -ldflags so
+          # `crate-agent version` reports the release tag.
+          make all VERSION="${GITHUB_REF#refs/tags/}"
+          ls -la dist/
+
+      - name: Compute SHA-256 checksums
+        run: |
+          cd dist
+          for f in crate-agent-*; do
+            shasum -a 256 "$f" > "${f}.sha256"
+          done
+          ls -la
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/crate-agent-darwin-amd64
+            dist/crate-agent-darwin-arm64
+            dist/crate-agent-linux-amd64
+            dist/crate-agent-linux-arm64
+            dist/crate-agent-darwin-amd64.sha256
+            dist/crate-agent-darwin-arm64.sha256
+            dist/crate-agent-linux-amd64.sha256
+            dist/crate-agent-linux-arm64.sha256
