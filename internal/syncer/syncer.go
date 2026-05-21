@@ -92,8 +92,10 @@ type Config struct {
 	BucketID string
 
 	// CapabilityRef is dereferenced on each upload; refresh runner mutates
-	// the pointee in place when the capability rotates.
+	// the pointee in place when the capability rotates. CapabilityMu
+	// guards reads + writes (security audit 2026-05 M1).
 	CapabilityRef *string
+	CapabilityMu  *sync.RWMutex
 
 	// MasterKeyRef is dereferenced on each upload. Salt reconciliation
 	// may have replaced the master key after pair-time.
@@ -379,7 +381,7 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 		return nil
 	}
 
-	cap := *s.cfg.CapabilityRef
+	cap := s.readCapability()
 	masterKey := *s.cfg.MasterKeyRef
 	if cap == "" || len(masterKey) == 0 {
 		return errors.New("syncer: daemon not ready (capability or master key empty)")
@@ -452,8 +454,47 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 
 	// Append manifest event + flush.
 	s.cfg.ManifestMu.Lock()
+	// Re-check the current manifest state UNDER the lock — the puller
+	// may have replaced or mutated the manifest between our pre-encrypt
+	// snapshot above and now. If the path's situation changed (the
+	// UUID we picked is no longer the current one for this path, or
+	// the path got deleted entirely), the append we'd produce here
+	// could silently lose a remote update. Re-resolve from the live
+	// manifest and decide create-vs-update again. See 2026-05 security
+	// audit, H4.
+	currentTree := s.cfg.ManifestRef.Materialise()
+	currentEntry := currentTree[manifestPath]
+	createPath := existing == nil || existing.IsDir || existing.UUID == ""
+	if createPath {
+		// We thought this was a create. If the puller just landed a
+		// remote create for the same path with a different UUID,
+		// appending another create silently loses the remote one. Abort
+		// + return; the watcher will re-queue this row, the conflict
+		// rename path will catch up. Better to drop the local write
+		// than clobber the user's remote.
+		if currentEntry != nil && !currentEntry.IsDir && currentEntry.UUID != "" && currentEntry.UUID != uuid {
+			s.cfg.ManifestMu.Unlock()
+			return fmt.Errorf("syncer: race with puller — %s now has UUID %s remotely, abort local upload (will retry)",
+				manifestPath, currentEntry.UUID)
+		}
+	} else {
+		// We thought this was an update of `existing.UUID`. If the
+		// current UUID at this path is different, the remote raced us.
+		// Same conservative response.
+		if currentEntry == nil || currentEntry.IsDir || currentEntry.UUID == "" {
+			s.cfg.ManifestMu.Unlock()
+			return fmt.Errorf("syncer: race — %s no longer exists in manifest, abort update of %s (will retry)",
+				manifestPath, uuid)
+		}
+		if currentEntry.UUID != existing.UUID {
+			s.cfg.ManifestMu.Unlock()
+			return fmt.Errorf("syncer: race — %s UUID rotated under us (%s → %s), abort update (will retry)",
+				manifestPath, existing.UUID, currentEntry.UUID)
+		}
+	}
+
 	var evtErr error
-	if existing != nil && !existing.IsDir && existing.UUID != "" {
+	if !createPath {
 		_, evtErr = s.cfg.ManifestRef.Append(
 			manifest.UpdateEvent(uuid, int64(len(plain)), contentIV),
 			masterKey,
@@ -501,7 +542,7 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 }
 
 func (s *Syncer) executeDelete(ctx context.Context, row *state.QueueEntry) error {
-	cap := *s.cfg.CapabilityRef
+	cap := s.readCapability()
 	masterKey := *s.cfg.MasterKeyRef
 	if cap == "" || len(masterKey) == 0 {
 		return errors.New("syncer: daemon not ready")
@@ -653,6 +694,19 @@ func (s *Syncer) putManifest(ctx context.Context, body []byte, cap string, appen
 
 // computeBackoff returns the next-attempt delay for an upload that has been
 // tried `attempts` times (1-indexed). Exponential with cap.
+// readCapability returns the current capability under the shared
+// RWMutex. Refresh runner holds the write side; this is the read side.
+// Falls through to a plain deref if no mutex was configured (the
+// daemon was wired without the refresh runner — only in tests).
+func (s *Syncer) readCapability() string {
+	if s.cfg.CapabilityMu == nil {
+		return *s.cfg.CapabilityRef
+	}
+	s.cfg.CapabilityMu.RLock()
+	defer s.cfg.CapabilityMu.RUnlock()
+	return *s.cfg.CapabilityRef
+}
+
 func (s *Syncer) computeBackoff(attempts int) time.Duration {
 	if attempts < 1 {
 		attempts = 1

@@ -42,30 +42,61 @@ var ErrNotRunning = errors.New("pidfile: no running daemon")
 
 // Create writes the current process's PID to path, creating parent dirs
 // (mode 0700). If a pidfile exists AND the recorded PID is still running,
-// returns ErrAlreadyRunning. Stale files (process gone) are silently
-// overwritten.
+// returns ErrAlreadyRunning. Stale files (process gone) are removed +
+// the call retries.
+//
+// The atomic-create pattern (O_CREATE|O_EXCL) closes a TOCTOU race where
+// two simultaneous starts could both pass stale-detection on the
+// previous version of this code (read-then-write-then-rename) and end
+// up running concurrently. With O_EXCL, only the first to open wins;
+// the loser observes ErrAlreadyRunning. See 2026-05 security audit L2.
 func Create(path string) error {
 	if path == "" {
 		return errors.New("pidfile: path is required")
 	}
-	if pid, err := readPID(path); err == nil {
-		if processAlive(pid) {
-			return fmt.Errorf("%w (pid %d at %s)", ErrAlreadyRunning, pid, path)
-		}
-		// Stale — fall through and overwrite.
-	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("pidfile: mkdir %s: %w", filepath.Dir(path), err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
-		return fmt.Errorf("pidfile: write %s: %w", tmp, err)
+
+	// We try at most twice: first attempt expects no existing file; on
+	// failure we check whether the existing file is stale, remove it,
+	// and try once more. A second-time failure means a concurrent
+	// starter beat us — return ErrAlreadyRunning.
+	for attempt := 0; attempt < 2; attempt++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+		if err == nil {
+			_, writeErr := f.WriteString(strconv.Itoa(os.Getpid()) + "\n")
+			closeErr := f.Close()
+			if writeErr != nil {
+				_ = os.Remove(path)
+				return fmt.Errorf("pidfile: write %s: %w", path, writeErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("pidfile: close %s: %w", path, closeErr)
+			}
+			return nil
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("pidfile: open %s: %w", path, err)
+		}
+		// File exists. Check stale-ness; if stale, remove + retry once.
+		// If live, refuse.
+		pid, readErr := readPID(path)
+		if readErr == nil && processAlive(pid) {
+			return fmt.Errorf("%w (pid %d at %s)", ErrAlreadyRunning, pid, path)
+		}
+		// Stale (or unreadable — same treatment, we own this path).
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("pidfile: remove stale %s: %w", path, err)
+		}
+		// Loop to try the O_EXCL create again. If a second starter
+		// races us to the create call, they win and we return
+		// ErrAlreadyRunning on the next iteration.
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("pidfile: rename %s → %s: %w", tmp, path, err)
-	}
-	return nil
+	// Two consecutive O_EXCL failures means a concurrent starter beat
+	// us to the create. Treat as already-running.
+	pid, _ := readPID(path)
+	return fmt.Errorf("%w (concurrent start, pid %d at %s)", ErrAlreadyRunning, pid, path)
 }
 
 // Remove deletes the pidfile. Missing file is not an error — graceful

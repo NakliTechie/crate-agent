@@ -226,12 +226,17 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	sharedManifestMu := &sync.Mutex{}
 	sharedManifestETag := ""
 	sharedLastFlushedEventCount := 0
+	// sharedCapabilityMu guards the live capability pointer that the
+	// refresh runner writes and the syncer/puller read. Closes the Go
+	// data race flagged in the 2026-05 security audit (finding M1).
+	sharedCapabilityMu := &sync.RWMutex{}
 
 	// --- Sync loop -------------------------------------------------------
 	syn, err := syncer.New(syncer.Config{
 		LocalPath:                cfg.Crate.LocalPath,
 		BucketID:                 cfg.Crate.BucketID,
 		CapabilityRef:            &liveCapability,
+		CapabilityMu:             sharedCapabilityMu,
 		MasterKeyRef:             &masterKey,
 		ManifestRef:              sharedManifest,
 		ManifestMu:               sharedManifestMu,
@@ -253,6 +258,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		MasterKey:     masterKey,
 		Hub:           client,
 		CapabilityRef: &liveCapability,
+		CapabilityMu:  sharedCapabilityMu,
 		Logger:        slog.Default(),
 	})
 	if err != nil {
@@ -264,6 +270,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		LocalPath:                cfg.Crate.LocalPath,
 		BucketID:                 cfg.Crate.BucketID,
 		CapabilityRef:            &liveCapability,
+		CapabilityMu:             sharedCapabilityMu,
 		MasterKeyRef:             &masterKey,
 		ManifestRef:              sharedManifest,
 		ManifestMu:               sharedManifestMu,

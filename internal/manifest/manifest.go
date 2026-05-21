@@ -12,6 +12,7 @@
 package manifest
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -125,7 +126,13 @@ func (m *Manifest) Verify(masterKey []byte) (bool, int, string) {
 		if err != nil {
 			return false, i, "sign recompute failed: " + err.Error()
 		}
-		if want != sigB64 {
+		// Constant-time compare. `want` and `sigB64` are both base64-
+		// encoded HMAC outputs; comparing the encoded strings is
+		// equivalent to comparing the underlying bytes IF the encoding
+		// is deterministic (it is — base64 std with no padding
+		// variance). subtle.ConstantTimeCompare returns 1 on equal.
+		// See 2026-05 security audit, L1.
+		if subtle.ConstantTimeCompare([]byte(want), []byte(sigB64)) != 1 {
 			return false, i, "sig mismatch"
 		}
 		prev = sigB64

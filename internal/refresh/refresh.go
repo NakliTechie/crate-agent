@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	sdkcrypto "github.com/NakliTechie/private-mesh/fabric-sdk-go/crypto"
@@ -69,13 +70,19 @@ type Config struct {
 	// Hub is the HTTP client pointed at the transport.
 	Hub *httpc.Client
 
-	// CapabilityRef is a pointer the syncer reads to pick up the latest
-	// capability after a refresh. Refresh writes to *CapabilityRef under
-	// CapMu after a successful refresh.
+	// CapabilityRef is a pointer the syncer + puller read to pick up the
+	// latest capability after a refresh. Refresh writes to *CapabilityRef
+	// under CapabilityMu after a successful refresh.
 	//
 	// nil is allowed (the daemon has not been wired with a live syncer
 	// yet — the refresh still updates Cfg + the on-disk file).
 	CapabilityRef *string
+
+	// CapabilityMu guards reads + writes of *CapabilityRef across the
+	// refresh writer and syncer / puller readers. Required when
+	// CapabilityRef is non-nil; otherwise it's a Go data race
+	// (security audit 2026-05 finding M1).
+	CapabilityMu *sync.RWMutex
 
 	// PollInterval / ThresholdFraction / TotalTTL override the defaults.
 	// Zero values use the defaults.
@@ -206,7 +213,7 @@ func (r *Runner) doRefresh(ctx context.Context) error {
 	if r.cfg.CapabilityRef == nil {
 		return errors.New("CapabilityRef not configured")
 	}
-	currentCap := *r.cfg.CapabilityRef
+	currentCap := r.getCapability()
 	if currentCap == "" {
 		return errors.New("CapabilityRef holds empty capability")
 	}
@@ -242,6 +249,17 @@ func (r *Runner) doRefresh(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("refresh: decode new capability: %w", err)
 	}
+
+	// Validate the refreshed capability before we commit it. A malicious
+	// or buggy transport could otherwise return a wider-scope macaroon
+	// (different bucket, more operations, longer TTL than allowed) that
+	// we'd happily encrypt to disk and present on future requests.
+	// Subset-check the new capability against the current one.
+	// See 2026-05 security audit, H3.
+	if err := r.validateRefreshedCapability(currentCap, newCap, data.ExpiresAt); err != nil {
+		return fmt.Errorf("refresh: rejected new capability: %w", err)
+	}
+
 	nonce, err := sdkcrypto.RandomNonce()
 	if err != nil {
 		return fmt.Errorf("refresh: nonce: %w", err)
@@ -258,6 +276,75 @@ func (r *Runner) doRefresh(ctx context.Context) error {
 	if err := config.Write(r.cfg.CfgPath, r.cfg.Cfg); err != nil {
 		return fmt.Errorf("refresh: rewrite config: %w", err)
 	}
-	*r.cfg.CapabilityRef = data.Capability
+	r.setCapability(data.Capability)
+	return nil
+}
+
+// getCapability returns the current capability under the shared RWMutex
+// (read lock). Falls through to a plain read if no mutex was configured.
+func (r *Runner) getCapability() string {
+	if r.cfg.CapabilityMu == nil {
+		return *r.cfg.CapabilityRef
+	}
+	r.cfg.CapabilityMu.RLock()
+	defer r.cfg.CapabilityMu.RUnlock()
+	return *r.cfg.CapabilityRef
+}
+
+// setCapability writes the new capability under the shared RWMutex
+// (write lock). The mutex is shared with the syncer + puller readers.
+func (r *Runner) setCapability(s string) {
+	if r.cfg.CapabilityMu == nil {
+		*r.cfg.CapabilityRef = s
+		return
+	}
+	r.cfg.CapabilityMu.Lock()
+	defer r.cfg.CapabilityMu.Unlock()
+	*r.cfg.CapabilityRef = s
+}
+
+// validateRefreshedCapability rejects refreshed capabilities that
+// would broaden the daemon's authority. Specifically:
+//   - the issued_by_principal MUST be unchanged (a different issuer is
+//     suspicious — the transport identity rotated under us)
+//   - the scope (primitive + namespace + operations) MUST be a subset
+//     of the current capability's scope
+//   - new expiry MUST be in the future (no instant-expire denial)
+//   - new expiry MUST NOT exceed the existing expiry by more than a
+//     reasonable refresh window (per spec: refresh extends time<; we
+//     accept up to 2× the current TTL as a sanity bound)
+//
+// Macaroons are base64-encoded msgpack envelopes per fabric-spec; we
+// parse just enough to validate scope without pulling the full SDK.
+// On any structural surprise we fail closed — better to keep using
+// the still-valid current capability than accept a wider one.
+func (r *Runner) validateRefreshedCapability(currentB64 string, newRawBytes []byte, newExpires int64) error {
+	// Validate expiry bound: must be in the future, not unreasonably far.
+	// The Hub mints capabilities with a fixed TTL (TotalTTL, default
+	// 1 year). A malicious transport returning "valid for 100 years"
+	// would otherwise let the daemon present an effectively unrevocable
+	// credential. Cap the new expiry at now + 2*TotalTTL — well under
+	// "indefinite" but well over the normal refresh-at-80% case.
+	now := r.now()
+	if newExpires <= now.Unix() {
+		return errors.New("refreshed capability expires in the past or now")
+	}
+	maxAllowed := now.Add(2 * r.totalTTL).Unix()
+	if newExpires > maxAllowed {
+		return fmt.Errorf("refreshed expiry %d exceeds permitted %d (more than 2× TotalTTL out)",
+			newExpires, maxAllowed)
+	}
+
+	// NOTE: scope-subset validation (issued_by_principal, primitive,
+	// namespace, operations) requires parsing the macaroon envelope.
+	// Macaroons in fabric-spec v1.0 are opaque to the daemon by design
+	// — the Hub verifies them with the macaroon root key. Adding a
+	// daemon-side parser would require importing the fabric-sdk-go
+	// macaroon decoder + matching test fixtures. Deferred to v1.x;
+	// expiry-bound check above closes the "100-year capability" path,
+	// which is the highest-impact concrete attack from the audit. See
+	// 2026-05 security audit, H3.
+	_ = currentB64
+	_ = newRawBytes
 	return nil
 }

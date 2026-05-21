@@ -62,8 +62,10 @@ type Config struct {
 	BucketID  string
 
 	// CapabilityRef is dereferenced on each tick — refresh runner mutates
-	// the pointee on capability rotation.
+	// the pointee on capability rotation. CapabilityMu guards reads +
+	// writes (security audit 2026-05 M1).
 	CapabilityRef *string
+	CapabilityMu  *sync.RWMutex
 
 	// MasterKeyRef is dereferenced on each tick — salt reconciliation
 	// may have replaced the master key after pair-time.
@@ -192,7 +194,7 @@ func (p *Puller) Stats() Stats {
 
 // tick is one reconciliation pass: GET manifest, materialise, reconcile.
 func (p *Puller) tick(ctx context.Context) {
-	cap := *p.cfg.CapabilityRef
+	cap := p.readCapability()
 	mk := *p.cfg.MasterKeyRef
 	if cap == "" || len(mk) == 0 {
 		// Daemon not ready (capability unset / master key not yet derived).
@@ -501,6 +503,17 @@ func (p *Puller) handleRemoteDelete(ctx context.Context, key string) error {
 }
 
 // --- helpers --------------------------------------------------------------
+
+// readCapability reads the current capability under the shared
+// RWMutex when wired. The refresh runner holds the write side.
+func (p *Puller) readCapability() string {
+	if p.cfg.CapabilityMu == nil {
+		return *p.cfg.CapabilityRef
+	}
+	p.cfg.CapabilityMu.RLock()
+	defer p.cfg.CapabilityMu.RUnlock()
+	return *p.cfg.CapabilityRef
+}
 
 func stripLeadingSlash(s string) string {
 	if len(s) > 0 && s[0] == '/' {
