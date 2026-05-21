@@ -208,3 +208,86 @@ func TestDefaultPath(t *testing.T) {
 		t.Errorf("DefaultPath = %q, want %q", got, want)
 	}
 }
+
+// TestManifestAnchor exercises the v3 migration's manifest_anchor table:
+// missing-row returns (nil, nil), round-trip, upsert advances the count.
+func TestManifestAnchor(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	// Missing row → (nil, nil), no error (TOFU signal).
+	got, err := s.GetManifestAnchor(ctx, "bucket-A")
+	if err != nil {
+		t.Fatalf("GetManifestAnchor missing: %v", err)
+	}
+	if got != nil {
+		t.Errorf("missing bucket returned non-nil anchor: %+v", got)
+	}
+
+	// Insert baseline.
+	if err := s.SetManifestAnchor(ctx, "bucket-A", ManifestAnchor{
+		Count: 3, LastSig: "sig-of-event-3",
+	}); err != nil {
+		t.Fatalf("SetManifestAnchor: %v", err)
+	}
+	got, err = s.GetManifestAnchor(ctx, "bucket-A")
+	if err != nil {
+		t.Fatalf("Get after Set: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Get after Set returned nil")
+	}
+	if got.Count != 3 || got.LastSig != "sig-of-event-3" {
+		t.Errorf("round-trip: got %+v, want count=3 sig=sig-of-event-3", got)
+	}
+	if got.UpdatedAt.IsZero() {
+		t.Error("UpdatedAt unset after Set")
+	}
+
+	// Overwrite (advance).
+	if err := s.SetManifestAnchor(ctx, "bucket-A", ManifestAnchor{
+		Count: 7, LastSig: "sig-of-event-7",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetManifestAnchor(ctx, "bucket-A")
+	if got.Count != 7 || got.LastSig != "sig-of-event-7" {
+		t.Errorf("after advance: got %+v, want count=7", got)
+	}
+
+	// Independence across buckets.
+	if err := s.SetManifestAnchor(ctx, "bucket-B", ManifestAnchor{
+		Count: 1, LastSig: "sig-B",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.GetManifestAnchor(ctx, "bucket-A")
+	b, _ := s.GetManifestAnchor(ctx, "bucket-B")
+	if a.Count != 7 || b.Count != 1 {
+		t.Errorf("bucket independence broken: A=%d B=%d", a.Count, b.Count)
+	}
+
+	// Empty bucket id rejected on both Get + Set.
+	if _, err := s.GetManifestAnchor(ctx, ""); err == nil {
+		t.Error("GetManifestAnchor empty bucket: expected error, got nil")
+	}
+	if err := s.SetManifestAnchor(ctx, "", ManifestAnchor{Count: 1}); err == nil {
+		t.Error("SetManifestAnchor empty bucket: expected error, got nil")
+	}
+}
+
+// TestManifestAnchorClockOverride verifies WithClock is honoured for the
+// UpdatedAt field.
+func TestManifestAnchorClockOverride(t *testing.T) {
+	s := newStore(t)
+	fixed := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	s.WithClock(func() time.Time { return fixed })
+	ctx := context.Background()
+	if err := s.SetManifestAnchor(ctx, "bucket-T", ManifestAnchor{Count: 1, LastSig: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetManifestAnchor(ctx, "bucket-T")
+	if !got.UpdatedAt.Equal(fixed) {
+		t.Errorf("UpdatedAt = %v, want %v", got.UpdatedAt, fixed)
+	}
+}

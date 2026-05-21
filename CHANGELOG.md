@@ -4,7 +4,17 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
-### Security — patches from the 2026-05 audit
+## [1.0.1] — 2026-05-21
+
+### Security — second round (manifest rollback + full scope-subset)
+
+The two architecturally-deferred findings from the 2026-05 audit have now landed in a single follow-up release. Both required real new code, not one-line patches; they're broken out from the v1.0.0 "quick fixes" so the changelog reflects the work.
+
+- **H1 — manifest rollback / truncation detection** ([`<pending>`](https://github.com/NakliTechie/crate-agent/commit/HEAD)). A bucket-only attacker can serve an older valid encrypted manifest — AES-GCM and the prev_sig chain both pass on the prefix, so the daemon previously accepted it silently. Fix: per-bucket `{count, lastSig}` anchor persisted in `state.db` (new migration v3: `manifest_anchor` table). On every puller tick after the AES-GCM + chain verification, the loaded manifest is validated against the anchor — **truncation** (loaded count < anchor count) and **fork** (chain diverges at the anchor point) both fail closed and skip the apply. First-load is TOFU + `slog.Info` log; subsequent loads enforce monotonic growth. 4 puller tests + 2 state tests cover TOFU, accept-extension, reject-truncation, reject-fork.
+
+- **H3 (full) — capability scope-subset validation** ([`<pending>`](https://github.com/NakliTechie/crate-agent/commit/HEAD)). `validateRefreshedCapability` previously only checked the expiry bounds (`now < expires ≤ now + 2×TotalTTL`). Now it imports `fabric-sdk-go/grant.Parse` to decode both the current and refreshed macaroon and enforce: issued_by_principal unchanged, primitive unchanged (`sync`), namespace unchanged (`bucket_id`), operations ⊆ current. Narrowed scope (e.g. drop `write`, keep `read`) is accepted; widening is rejected. 6 new tests in `internal/refresh/refresh_test.go` cover each rejection case + narrowing acceptance.
+
+### Security — patches from the 2026-05 audit (from v1.0.0; recap)
 
 OpenAI Codex (gpt-5.5) reviewed the daemon's encryption, sync, capability-handling, and lifecycle paths under a defined threat model. Four High + one Medium + two Low findings; quick fixes landed:
 
@@ -17,10 +27,9 @@ OpenAI Codex (gpt-5.5) reviewed the daemon's encryption, sync, capability-handli
 
 Full report: [`docs/security-review-2026-05-codex.md`](docs/security-review-2026-05-codex.md).
 
-### Deferred — H1 (manifest rollback) + full H3 (scope-subset validation)
+### Previously deferred — now landed in v1.0.1
 
-- **H1**: a malicious transport can serve an older valid encrypted manifest. AES-GCM + prev_sig chain both still pass — the older prefix really was valid once. Fix requires persistent state (last-seen tail anchor in `state.db`) coordinated with the browser side's tab-scoped anchor. v1.x work, tracked.
-- **H3 (full scope-subset validation)**: the refreshed capability is currently only checked for expiry bounds. Full scope-subset validation (issuer, primitive, namespace, operations) requires importing the `fabric-sdk-go` macaroon decoder and matching test fixtures. The macaroon format is opaque to the daemon by design (the Hub verifies with the root key); adding daemon-side parsing is real work. v1.x. The expiry bound closes the highest-impact concrete attack (unrevokable credential), which is the meaningful payload here.
+H1 (manifest rollback) and the full H3 (scope-subset validation) were both deferred from v1.0.0 with the rationale that they needed real new code (persistent state for H1, macaroon-decoder import for H3). Both landed in v1.0.1 above. No outstanding audit items.
 
 ## [1.0.0] — 2026-05-21
 

@@ -80,6 +80,20 @@ ALTER TABLE manifest_cache ADD COLUMN uuid TEXT;
 ALTER TABLE manifest_cache ADD COLUMN content_iv TEXT;
 CREATE INDEX idx_manifest_uuid ON manifest_cache(uuid);
 `,
+	// 3: v1.0.1 manifest rollback anchor (audit finding H1). Per-bucket
+	// {count, last_sig} pair that the puller validates before applying a
+	// freshly pulled manifest. Closes the "bucket attacker serves an
+	// older valid encrypted manifest" attack — AES-GCM + prev_sig pass
+	// on the prefix, but the anchor refuses any manifest that doesn't
+	// extend (or match) the highest-count chain we've ever accepted.
+	`
+CREATE TABLE manifest_anchor (
+    bucket_id TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    last_sig TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+`,
 }
 
 // Store is the open SQLite connection + a clock for testable timestamps.
@@ -523,4 +537,66 @@ func (s *Store) GetWatcherState(ctx context.Context, key string) (string, error)
 		return "", fmt.Errorf("GetWatcherState: %w", err)
 	}
 	return v, nil
+}
+
+// --- manifest_anchor (v1.0.1 H1 patch) -----------------------------------
+
+// ManifestAnchor is the {count, lastSig} pair the puller persists per
+// bucket. Used to refuse manifest rollbacks per the 2026-05 audit's H1.
+type ManifestAnchor struct {
+	Count     int    // event count of the highest-ever-accepted manifest
+	LastSig   string // base64 HMAC of the last event in that manifest
+	UpdatedAt time.Time
+}
+
+// GetManifestAnchor returns the persisted anchor for bucketID, or (nil, nil)
+// if no anchor exists yet (first load: TOFU on the next puller tick).
+func (s *Store) GetManifestAnchor(ctx context.Context, bucketID string) (*ManifestAnchor, error) {
+	if bucketID == "" {
+		return nil, errors.New("GetManifestAnchor: bucketID is empty")
+	}
+	var (
+		a         ManifestAnchor
+		updatedAt string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count, last_sig, updated_at FROM manifest_anchor WHERE bucket_id = ?`,
+		bucketID,
+	).Scan(&a.Count, &a.LastSig, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("GetManifestAnchor: %w", err)
+	}
+	if t, perr := time.Parse(time.RFC3339Nano, updatedAt); perr == nil {
+		a.UpdatedAt = t
+	}
+	return &a, nil
+}
+
+// SetManifestAnchor upserts the anchor for bucketID. Callers should only
+// advance the anchor (never roll it back) — the puller enforces this in
+// its validation logic before calling SetManifestAnchor.
+func (s *Store) SetManifestAnchor(ctx context.Context, bucketID string, anchor ManifestAnchor) error {
+	if bucketID == "" {
+		return errors.New("SetManifestAnchor: bucketID is empty")
+	}
+	if anchor.UpdatedAt.IsZero() {
+		anchor.UpdatedAt = s.now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO manifest_anchor (bucket_id, count, last_sig, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(bucket_id) DO UPDATE SET
+            count      = excluded.count,
+            last_sig   = excluded.last_sig,
+            updated_at = excluded.updated_at`,
+		bucketID, anchor.Count, anchor.LastSig,
+		anchor.UpdatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return fmt.Errorf("SetManifestAnchor: %w", err)
+	}
+	return nil
 }

@@ -233,6 +233,19 @@ func (p *Puller) tick(ctx context.Context) {
 		return
 	}
 
+	// 2b. Rollback anchor check. A bucket-only attacker can serve an
+	// older valid encrypted manifest — AES-GCM authenticates with the
+	// unchanged master key, prev_sig chain over the older prefix is
+	// still valid. The anchor refuses any manifest that doesn't extend
+	// (or match) the highest-count chain we've ever accepted on this
+	// device. First load TOFUs (anchor is nil → accept + record).
+	// See 2026-05 security audit, finding H1.
+	if ok, reason := p.validateAndAdvanceAnchor(ctx, fresh); !ok {
+		p.logger.Warn("manifest rollback detected; refusing to apply",
+			"reason", reason)
+		return
+	}
+
 	// 3. Replace the shared in-memory manifest under the lock + update
 	// the M6.x bookkeeping fields the syncer's putManifest depends on.
 	p.cfg.ManifestMu.Lock()
@@ -500,6 +513,72 @@ func (p *Puller) handleRemoteDelete(ctx context.Context, key string) error {
 		p.logger.Info("removed local (remote deleted)", "key", key, "local", localAbs)
 	}
 	return p.cfg.State.DeleteManifestEntry(ctx, key)
+}
+
+// validateAndAdvanceAnchor checks `fresh` against the persisted rollback
+// anchor (state.manifest_anchor row keyed by bucket_id). Returns
+// (true, "") on accept (and writes the new anchor); returns (false, reason)
+// on rejection, in which case the caller must skip the apply.
+//
+// First-load semantics (no anchor row): trust-on-first-use, log at info
+// level, save the current state as the baseline. Subsequent loads MUST
+// extend (count grows + chain matches at the anchor point) OR match
+// (idempotent re-load of the same manifest). A shorter count or a
+// diverging chain at the anchor point is rejected.
+func (p *Puller) validateAndAdvanceAnchor(ctx context.Context, fresh *manifest.Manifest) (bool, string) {
+	events := fresh.Events()
+	loadedCount := len(events)
+	loadedLastSig := ""
+	if loadedCount > 0 {
+		if s, ok := events[loadedCount-1]["sig"].(string); ok {
+			loadedLastSig = s
+		}
+	}
+
+	prior, err := p.cfg.State.GetManifestAnchor(ctx, p.cfg.BucketID)
+	if err != nil {
+		// Anchor lookup failed — fail closed: better to skip a tick than
+		// silently lose the rollback protection.
+		return false, fmt.Sprintf("anchor lookup failed: %v", err)
+	}
+	if prior == nil {
+		// TOFU: first ever load on this device for this bucket.
+		p.logger.Info("anchoring manifest to current state (first load)",
+			"bucket_id", p.cfg.BucketID,
+			"count", loadedCount)
+		if werr := p.cfg.State.SetManifestAnchor(ctx, p.cfg.BucketID, state.ManifestAnchor{
+			Count:   loadedCount,
+			LastSig: loadedLastSig,
+		}); werr != nil {
+			// Don't fail the tick — the anchor write is best-effort.
+			// Next tick re-TOFUs at the same or higher count.
+			p.logger.Warn("anchor write failed (will retry next tick)", "err", werr)
+		}
+		return true, ""
+	}
+
+	if loadedCount < prior.Count {
+		return false, fmt.Sprintf("truncation: loaded count %d < anchor count %d",
+			loadedCount, prior.Count)
+	}
+	// loadedCount >= prior.Count — verify chain continuity at the anchor.
+	// (If prior.Count == 0, the anchor was empty; any first event extends.)
+	if prior.Count > 0 {
+		anchorEvt := events[prior.Count-1]
+		anchorSig, _ := anchorEvt["sig"].(string)
+		if anchorSig != prior.LastSig {
+			return false, fmt.Sprintf("fork: event[%d].sig differs from anchor.lastSig",
+				prior.Count-1)
+		}
+	}
+	// Advance (or keep) the anchor.
+	if werr := p.cfg.State.SetManifestAnchor(ctx, p.cfg.BucketID, state.ManifestAnchor{
+		Count:   loadedCount,
+		LastSig: loadedLastSig,
+	}); werr != nil {
+		p.logger.Warn("anchor advance failed (will retry next tick)", "err", werr)
+	}
+	return true, ""
 }
 
 // --- helpers --------------------------------------------------------------

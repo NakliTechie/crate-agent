@@ -22,10 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
 	sdkcrypto "github.com/NakliTechie/private-mesh/fabric-sdk-go/crypto"
+	"github.com/NakliTechie/private-mesh/fabric-sdk-go/grant"
 
 	"github.com/NakliTechie/crate-agent/internal/config"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
@@ -303,28 +305,27 @@ func (r *Runner) setCapability(s string) {
 	*r.cfg.CapabilityRef = s
 }
 
-// validateRefreshedCapability rejects refreshed capabilities that
-// would broaden the daemon's authority. Specifically:
-//   - the issued_by_principal MUST be unchanged (a different issuer is
-//     suspicious — the transport identity rotated under us)
-//   - the scope (primitive + namespace + operations) MUST be a subset
-//     of the current capability's scope
-//   - new expiry MUST be in the future (no instant-expire denial)
-//   - new expiry MUST NOT exceed the existing expiry by more than a
-//     reasonable refresh window (per spec: refresh extends time<; we
-//     accept up to 2× the current TTL as a sanity bound)
+// validateRefreshedCapability rejects refreshed capabilities that would
+// broaden the daemon's authority. Checks:
 //
-// Macaroons are base64-encoded msgpack envelopes per fabric-spec; we
-// parse just enough to validate scope without pulling the full SDK.
-// On any structural surprise we fail closed — better to keep using
-// the still-valid current capability than accept a wider one.
+//   - expiry MUST be in the future
+//   - expiry MUST NOT exceed now + 2 × TotalTTL (sanity bound; a malicious
+//     transport returning "valid for 100 years" would otherwise let the
+//     daemon present an effectively unrevocable credential)
+//   - both capabilities MUST decode as macaroons via fabric-sdk-go/grant.Parse
+//   - issued_by_principal MUST match the current (rotating the issuer under
+//     us is suspicious + breaks the daemon's caller identity)
+//   - primitive MUST match (current daemon scope is `sync`; a refresh that
+//     returned `vault` or `bridge` is rejected)
+//   - namespace MUST match (the bucket_id can't change across refresh)
+//   - operations MUST be a subset of the current operations (a refresh that
+//     widens read-only → read-write is rejected)
+//
+// On any structural surprise we fail closed — keep using the still-valid
+// current capability rather than accept an unverifiable replacement. See
+// 2026-05 security audit, H3.
 func (r *Runner) validateRefreshedCapability(currentB64 string, newRawBytes []byte, newExpires int64) error {
-	// Validate expiry bound: must be in the future, not unreasonably far.
-	// The Hub mints capabilities with a fixed TTL (TotalTTL, default
-	// 1 year). A malicious transport returning "valid for 100 years"
-	// would otherwise let the daemon present an effectively unrevocable
-	// credential. Cap the new expiry at now + 2*TotalTTL — well under
-	// "indefinite" but well over the normal refresh-at-80% case.
+	// 1. Expiry bounds (cheapest check, runs first).
 	now := r.now()
 	if newExpires <= now.Unix() {
 		return errors.New("refreshed capability expires in the past or now")
@@ -335,16 +336,73 @@ func (r *Runner) validateRefreshedCapability(currentB64 string, newRawBytes []by
 			newExpires, maxAllowed)
 	}
 
-	// NOTE: scope-subset validation (issued_by_principal, primitive,
-	// namespace, operations) requires parsing the macaroon envelope.
-	// Macaroons in fabric-spec v1.0 are opaque to the daemon by design
-	// — the Hub verifies them with the macaroon root key. Adding a
-	// daemon-side parser would require importing the fabric-sdk-go
-	// macaroon decoder + matching test fixtures. Deferred to v1.x;
-	// expiry-bound check above closes the "100-year capability" path,
-	// which is the highest-impact concrete attack from the audit. See
-	// 2026-05 security audit, H3.
-	_ = currentB64
-	_ = newRawBytes
+	// 2. Decode the current capability (base64-wrapped macaroon bytes).
+	currentBytes, err := base64.StdEncoding.DecodeString(currentB64)
+	if err != nil {
+		return fmt.Errorf("decode current capability: %w", err)
+	}
+	current, err := grant.Parse(currentBytes)
+	if err != nil {
+		return fmt.Errorf("parse current capability: %w", err)
+	}
+	next, err := grant.Parse(newRawBytes)
+	if err != nil {
+		return fmt.Errorf("parse refreshed capability: %w", err)
+	}
+
+	// 3. Issuer identity unchanged.
+	if next.Identifier.IssuedByPrincipal != current.Identifier.IssuedByPrincipal {
+		return fmt.Errorf("refreshed issuer %q differs from current %q",
+			next.Identifier.IssuedByPrincipal, current.Identifier.IssuedByPrincipal)
+	}
+
+	// 4. Primitive unchanged (daemon binds to sync; a different primitive
+	// is structurally wrong even if the issuer matches).
+	if next.Identifier.Scope.Primitive != current.Identifier.Scope.Primitive {
+		return fmt.Errorf("refreshed primitive %q differs from current %q",
+			next.Identifier.Scope.Primitive, current.Identifier.Scope.Primitive)
+	}
+
+	// 5. Namespace unchanged. The current capability's namespace pins it
+	// to a specific bucket_id (or wildcard "*"). A refresh to a different
+	// bucket would let the daemon read/write a folder it was never paired
+	// for. Wildcard-current accepts any namespace (broadest scope already);
+	// any other current value pins exactly.
+	if current.Identifier.Scope.Namespace != "*" &&
+		next.Identifier.Scope.Namespace != current.Identifier.Scope.Namespace {
+		return fmt.Errorf("refreshed namespace %q differs from current %q",
+			next.Identifier.Scope.Namespace, current.Identifier.Scope.Namespace)
+	}
+
+	// 6. Operations subset. Build a set from the current and walk the
+	// new ones; any extra op is a scope widening.
+	currentOps := stringSet(current.Identifier.Scope.Operations)
+	for _, op := range next.Identifier.Scope.Operations {
+		if _, ok := currentOps[op]; !ok {
+			return fmt.Errorf("refreshed operations include %q which is not in current scope %v",
+				op, sortedKeys(currentOps))
+		}
+	}
+
 	return nil
+}
+
+// stringSet is a small set helper.
+func stringSet(ss []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(ss))
+	for _, s := range ss {
+		m[s] = struct{}{}
+	}
+	return m
+}
+
+// sortedKeys returns a deterministic sorted slice — used only in error
+// messages so test assertions stay stable.
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

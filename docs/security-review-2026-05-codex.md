@@ -1,6 +1,9 @@
 # crate-agent (daemon) — security review (Codex, 2026-05)
 
-**Status as of 2026-05-21**: H2 (path traversal) patched in [`73a37d7`](https://github.com/NakliTechie/crate-agent/commit/73a37d7). H3 expiry bound + H4 + M1 + L1 + L2 patched in [`3e20892`](https://github.com/NakliTechie/crate-agent/commit/3e20892). H1 (manifest rollback detection) and the full H3 scope-subset validation deferred to v1.x — H1 needs persistent state design across browser+daemon, full H3 needs the fabric-sdk-go macaroon decoder.
+**Status as of 2026-05-21**:
+- v1.0.0 quick fixes: H2 (path traversal) patched in [`73a37d7`](https://github.com/NakliTechie/crate-agent/commit/73a37d7); H3 expiry bound + H4 + M1 + L1 + L2 in [`3e20892`](https://github.com/NakliTechie/crate-agent/commit/3e20892).
+- v1.0.1 (architectural patches): H1 (manifest rollback) + full H3 (scope-subset via `fabric-sdk-go/grant.Parse`) landed in v1.0.1. New `state.manifest_anchor` table (migration v3); puller validates against the anchor on every tick. Refresh runner now decodes both current + refreshed macaroons and enforces issuer / primitive / namespace / operations-subset.
+- **No outstanding audit items.**
 
 The body below is the raw audit output, unedited.
 

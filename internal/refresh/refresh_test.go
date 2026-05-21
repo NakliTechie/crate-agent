@@ -13,10 +13,39 @@ import (
 	"time"
 
 	sdkcrypto "github.com/NakliTechie/private-mesh/fabric-sdk-go/crypto"
+	"github.com/NakliTechie/private-mesh/fabric-sdk-go/grant"
 
 	"github.com/NakliTechie/crate-agent/internal/config"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
 )
+
+// mintTestMacaroon builds a real fabric-spec-v1 macaroon for the test
+// fixtures. Returns the wire bytes (suitable for base64 + use as a
+// capability). Caller passes the principal/primitive/namespace/operations
+// they want to bind into the scope.
+func mintTestMacaroon(t *testing.T, principal, primitive, namespace string, ops []string) []byte {
+	t.Helper()
+	g, err := grant.Mint(grant.MintSpec{
+		RootKey:  make([]byte, 32), // tests don't verify signatures
+		Location: "*",
+		Identifier: grant.Identifier{
+			GrantID:           "01TESTGRANT0000000000000",
+			IssuedAt:          time.Now().UTC(),
+			IssuedByPrincipal: principal,
+			IssuedByKeypair:   make([]byte, 32),
+			Scope: grant.Scope{
+				Primitive:  grant.Primitive(primitive),
+				Namespace:  namespace,
+				Operations: append([]string(nil), ops...),
+			},
+		},
+		Caveats: []string{"time < 2027-01-01T00:00:00Z"},
+	})
+	if err != nil {
+		t.Fatalf("mintTestMacaroon: %v", err)
+	}
+	return g.Macaroon
+}
 
 // newMasterKey returns a random 32-byte key for tests.
 func newMasterKey(t *testing.T) []byte {
@@ -41,8 +70,15 @@ type fakeHub struct {
 
 func newFakeHub(t *testing.T) *fakeHub {
 	t.Helper()
+	// Default: mint a refreshed cap with the SAME scope as the current
+	// (test fixture issues both with principal="hub", primitive=sync,
+	// namespace="01HBUCKETID00000000000000", ops=[read,write]). Tests
+	// that exercise scope expansion override h.nextCap before invoking.
+	defaultRefreshed := mintTestMacaroon(t,
+		"hub", "sync", "01HBUCKETID00000000000000",
+		[]string{"read", "write"})
 	h := &fakeHub{
-		nextCap: base64.StdEncoding.EncodeToString([]byte("REFRESHED-CAPABILITY-BYTES-v1")),
+		nextCap: base64.StdEncoding.EncodeToString(defaultRefreshed),
 		nextExp: time.Now().Add(365 * 24 * time.Hour).Unix(),
 	}
 	h.ts = httptest.NewServer(http.HandlerFunc(h.serve))
@@ -86,10 +122,16 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 
 // seedConfig builds a Config + on-disk file representing a "paired" daemon.
 // expiresIn controls how far in the future the current capability's expiry sits.
+// The minted capability has scope (sync, "01HBUCKETID00000000000000", [read,write])
+// issued by principal "hub" — same scope the default newFakeHub returns, so
+// the happy-path refresh validates as a subset (equal scope).
 func seedConfig(t *testing.T, dir string, masterKey []byte, expiresIn time.Duration) (string, *config.Config, string) {
 	t.Helper()
-	// Encrypt a placeholder current capability under masterKey.
-	currentCap := []byte("CURRENT-CAPABILITY-BYTES-v1")
+	// Mint a real macaroon for the current capability (scope-validation in
+	// validateRefreshedCapability requires both current + new to be parseable).
+	currentCap := mintTestMacaroon(t,
+		"hub", "sync", "01HBUCKETID00000000000000",
+		[]string{"read", "write"})
 	nonce, err := sdkcrypto.RandomNonce()
 	if err != nil {
 		t.Fatal(err)
@@ -205,15 +247,19 @@ func TestDoRefresh_HappyPath(t *testing.T) {
 	if cap == "" {
 		t.Errorf("CapabilityRef was not updated")
 	}
-	// Decode the new sealed capability from cfg and confirm it decrypts.
+	// Decode the new sealed capability from cfg and confirm it decrypts +
+	// matches what the hub served (modulo base64). We can't compare to a
+	// literal string anymore because the refreshed capability is now a
+	// real macaroon (binary).
 	sealed, _ := base64.StdEncoding.DecodeString(cfg.Crate.PairingToken)
 	nonce, _ := base64.StdEncoding.DecodeString(cfg.Crate.CapabilityNonce)
 	plain, err := sdkcrypto.Open(mk, nonce, sealed, nil)
 	if err != nil {
 		t.Fatalf("re-encrypted capability does not Open: %v", err)
 	}
-	if string(plain) != "REFRESHED-CAPABILITY-BYTES-v1" {
-		t.Errorf("re-encrypted plaintext = %q, want REFRESHED-CAPABILITY-BYTES-v1", plain)
+	wantBytes, _ := base64.StdEncoding.DecodeString(hub.nextCap)
+	if base64.StdEncoding.EncodeToString(plain) != base64.StdEncoding.EncodeToString(wantBytes) {
+		t.Errorf("re-encrypted plaintext does not match hub.nextCap")
 	}
 	if cfg.Crate.CapabilityExpires != hub.nextExp {
 		t.Errorf("CapabilityExpires = %d, want %d", cfg.Crate.CapabilityExpires, hub.nextExp)
@@ -315,4 +361,129 @@ func TestRun_TriggersOnImmediateExpiry(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("Run did not trigger refresh; hub.calls=%d", hub.calls.Load())
+}
+
+// --- Scope-subset validation tests (v1.0.1 / audit H3 full) -----------
+
+// validationCase parameterises rejection scenarios for
+// validateRefreshedCapability. The current capability is always
+// (principal=hub, primitive=sync, namespace=01HBUCKETID..., ops=[read,write]).
+type validationCase struct {
+	name        string
+	newCap      func(t *testing.T) []byte
+	newExpires  int64
+	wantErrSub  string // substring expected in error message
+}
+
+func runValidationCase(t *testing.T, c validationCase) {
+	dir := t.TempDir()
+	mk := newMasterKey(t)
+	_, cfg, cap := seedConfig(t, dir, mk, 30*24*time.Hour)
+	r, err := New(Config{
+		CfgPath:       filepath.Join(dir, "p.toml"),
+		Cfg:           cfg,
+		MasterKey:     mk,
+		Hub:           httpc.New("http://x"),
+		CapabilityRef: &cap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp := c.newExpires
+	if exp == 0 {
+		exp = time.Now().Add(365 * 24 * time.Hour).Unix()
+	}
+	err = r.validateRefreshedCapability(cap, c.newCap(t), exp)
+	if err == nil {
+		t.Fatalf("expected rejection (%s); got accept", c.name)
+	}
+	if c.wantErrSub != "" && !contains(err.Error(), c.wantErrSub) {
+		t.Errorf("error %q does not contain %q", err.Error(), c.wantErrSub)
+	}
+}
+
+func contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+func TestValidate_RejectsDifferentIssuer(t *testing.T) {
+	runValidationCase(t, validationCase{
+		name: "different issuer",
+		newCap: func(t *testing.T) []byte {
+			return mintTestMacaroon(t, "rogue", "sync", "01HBUCKETID00000000000000",
+				[]string{"read", "write"})
+		},
+		wantErrSub: "issuer",
+	})
+}
+
+func TestValidate_RejectsDifferentPrimitive(t *testing.T) {
+	runValidationCase(t, validationCase{
+		name: "different primitive",
+		newCap: func(t *testing.T) []byte {
+			return mintTestMacaroon(t, "hub", "vault", "01HBUCKETID00000000000000",
+				[]string{"read", "write"})
+		},
+		wantErrSub: "primitive",
+	})
+}
+
+func TestValidate_RejectsDifferentNamespace(t *testing.T) {
+	runValidationCase(t, validationCase{
+		name: "different namespace",
+		newCap: func(t *testing.T) []byte {
+			return mintTestMacaroon(t, "hub", "sync", "OTHERBUCKETID000000000000",
+				[]string{"read", "write"})
+		},
+		wantErrSub: "namespace",
+	})
+}
+
+func TestValidate_RejectsExpandedOperations(t *testing.T) {
+	runValidationCase(t, validationCase{
+		name: "expanded operations",
+		newCap: func(t *testing.T) []byte {
+			return mintTestMacaroon(t, "hub", "sync", "01HBUCKETID00000000000000",
+				[]string{"read", "write", "delete"})
+		},
+		wantErrSub: `"delete"`,
+	})
+}
+
+func TestValidate_AcceptsNarrowedOperations(t *testing.T) {
+	// Narrowing (subset) MUST be accepted — the daemon would be losing
+	// authority, not gaining it. Refresh dropping a permission is rare
+	// in practice but structurally fine.
+	dir := t.TempDir()
+	mk := newMasterKey(t)
+	_, cfg, cap := seedConfig(t, dir, mk, 30*24*time.Hour)
+	r, _ := New(Config{
+		CfgPath:       filepath.Join(dir, "p.toml"),
+		Cfg:           cfg,
+		MasterKey:     mk,
+		Hub:           httpc.New("http://x"),
+		CapabilityRef: &cap,
+	})
+	narrower := mintTestMacaroon(t, "hub", "sync", "01HBUCKETID00000000000000",
+		[]string{"read"}) // dropped "write"
+	err := r.validateRefreshedCapability(cap,
+		narrower, time.Now().Add(365*24*time.Hour).Unix())
+	if err != nil {
+		t.Errorf("narrowed-scope refresh should be accepted; got %v", err)
+	}
+}
+
+func TestValidate_RejectsUnparseableNewCap(t *testing.T) {
+	runValidationCase(t, validationCase{
+		name: "garbage new cap",
+		newCap: func(t *testing.T) []byte {
+			return []byte("not a macaroon")
+		},
+		wantErrSub: "parse refreshed",
+	})
 }
