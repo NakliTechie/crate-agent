@@ -114,17 +114,21 @@ func setupPuller(t *testing.T) *rig {
 	}
 	man := manifest.New()
 	mu := &sync.Mutex{}
+	etag := ""
+	lastFlushed := 0
 
 	p, err := New(Config{
-		LocalPath:     localPath,
-		BucketID:      "bk_test",
-		CapabilityRef: &cap,
-		MasterKeyRef:  &mk,
-		ManifestRef:   man,
-		ManifestMu:    mu,
-		Hub:           client,
-		State:         store,
-		PollInterval:  50 * time.Millisecond,
+		LocalPath:                localPath,
+		BucketID:                 "bk_test",
+		CapabilityRef:            &cap,
+		MasterKeyRef:             &mk,
+		ManifestRef:              man,
+		ManifestMu:               mu,
+		ManifestETagRef:          &etag,
+		LastFlushedEventCountRef: &lastFlushed,
+		Hub:                      client,
+		State:                    store,
+		PollInterval:             50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -294,20 +298,26 @@ func TestPuller_NewRejectsBadConfig(t *testing.T) {
 		{"no MasterKeyRef", func(c *Config) { c.MasterKeyRef = nil }},
 		{"no ManifestRef", func(c *Config) { c.ManifestRef = nil }},
 		{"no ManifestMu", func(c *Config) { c.ManifestMu = nil }},
+		{"no ManifestETagRef", func(c *Config) { c.ManifestETagRef = nil }},
+		{"no LastFlushedEventCountRef", func(c *Config) { c.LastFlushedEventCountRef = nil }},
 		{"no Hub", func(c *Config) { c.Hub = nil }},
 		{"no State", func(c *Config) { c.State = nil }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			etag := ""
+			lastFlushed := 0
 			cfg := Config{
-				LocalPath:     filepath.Join(tmp, "f"),
-				BucketID:      "bk_x",
-				CapabilityRef: &cap,
-				MasterKeyRef:  &mk,
-				ManifestRef:   manifest.New(),
-				ManifestMu:    &sync.Mutex{},
-				Hub:           httpc.New("http://x"),
-				State:         store,
+				LocalPath:                filepath.Join(tmp, "f"),
+				BucketID:                 "bk_x",
+				CapabilityRef:            &cap,
+				MasterKeyRef:             &mk,
+				ManifestRef:              manifest.New(),
+				ManifestMu:               &sync.Mutex{},
+				ManifestETagRef:          &etag,
+				LastFlushedEventCountRef: &lastFlushed,
+				Hub:                      httpc.New("http://x"),
+				State:                    store,
 			}
 			c.mod(&cfg)
 			if _, err := New(cfg); err == nil {

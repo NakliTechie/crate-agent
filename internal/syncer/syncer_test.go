@@ -193,20 +193,24 @@ func setupSyncer(t *testing.T, cfgMods ...func(*Config)) *rig {
 	}
 	sharedManifest := manifest.New()
 	sharedManifestMu := &sync.Mutex{}
+	sharedETag := ""
+	sharedLastFlushed := 0
 
 	cfg := Config{
-		LocalPath:     localPath,
-		BucketID:      "bk_test",
-		CapabilityRef: &cap,
-		MasterKeyRef:  &masterKey,
-		ManifestRef:   sharedManifest,
-		ManifestMu:    sharedManifestMu,
-		Hub:           client,
-		Watcher:       w,
-		State:         store,
-		PollInterval:  50 * time.Millisecond,
-		BackoffBase:   50 * time.Millisecond,
-		BackoffCap:    200 * time.Millisecond,
+		LocalPath:                localPath,
+		BucketID:                 "bk_test",
+		CapabilityRef:            &cap,
+		MasterKeyRef:             &masterKey,
+		ManifestRef:              sharedManifest,
+		ManifestMu:               sharedManifestMu,
+		ManifestETagRef:          &sharedETag,
+		LastFlushedEventCountRef: &sharedLastFlushed,
+		Hub:                      client,
+		Watcher:                  w,
+		State:                    store,
+		PollInterval:             50 * time.Millisecond,
+		BackoffBase:              50 * time.Millisecond,
+		BackoffCap:               200 * time.Millisecond,
 	}
 	for _, m := range cfgMods {
 		m(&cfg)
@@ -468,6 +472,8 @@ func TestNewRejectsMissingFields(t *testing.T) {
 		{"no MasterKeyRef", func(c *Config) { c.MasterKeyRef = nil }},
 		{"no ManifestRef", func(c *Config) { c.ManifestRef = nil }},
 		{"no ManifestMu", func(c *Config) { c.ManifestMu = nil }},
+		{"no ManifestETagRef", func(c *Config) { c.ManifestETagRef = nil }},
+		{"no LastFlushedEventCountRef", func(c *Config) { c.LastFlushedEventCountRef = nil }},
 		{"no Hub", func(c *Config) { c.Hub = nil }},
 		{"no Watcher", func(c *Config) { c.Watcher = nil }},
 		{"no State", func(c *Config) { c.State = nil }},
@@ -482,16 +488,20 @@ func TestNewRejectsMissingFields(t *testing.T) {
 			defer w.Close()
 			cap := "cap"
 			mk := make([]byte, 32)
+			etag := ""
+			lastFlushed := 0
 			cfg := Config{
-				LocalPath:     filepath.Join(tmp, "crate"),
-				BucketID:      "bk_x",
-				CapabilityRef: &cap,
-				MasterKeyRef:  &mk,
-				ManifestRef:   manifest.New(),
-				ManifestMu:    &sync.Mutex{},
-				Hub:           httpc.New("http://127.0.0.1:1"),
-				Watcher:       w,
-				State:      store,
+				LocalPath:                filepath.Join(tmp, "crate"),
+				BucketID:                 "bk_x",
+				CapabilityRef:            &cap,
+				MasterKeyRef:             &mk,
+				ManifestRef:              manifest.New(),
+				ManifestMu:               &sync.Mutex{},
+				ManifestETagRef:          &etag,
+				LastFlushedEventCountRef: &lastFlushed,
+				Hub:                      httpc.New("http://127.0.0.1:1"),
+				Watcher:                  w,
+				State:                    store,
 			}
 			c.mod(&cfg)
 			if _, err := New(cfg); err == nil {

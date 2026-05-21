@@ -160,6 +160,22 @@ func (c *Client) PutObject(
 	contentType string,
 	capability string,
 ) (*Response, error) {
+	return c.PutObjectIfMatch(ctx, bucketID, remotePath, body, contentLength, contentType, "", capability)
+}
+
+// PutObjectIfMatch is PutObject + an `If-Match` precondition header. R2
+// returns HTTP 412 when the bucket object's ETag doesn't match `ifMatch`
+// — used by the syncer for M6.x concurrent-write safety on the manifest
+// PUT. Pass "" for `ifMatch` to leave the PUT unconditional.
+func (c *Client) PutObjectIfMatch(
+	ctx context.Context,
+	bucketID, remotePath string,
+	body io.Reader,
+	contentLength int64,
+	contentType string,
+	ifMatch string,
+	capability string,
+) (*Response, error) {
 	path := "/v1/crate/object/" + url.PathEscape(bucketID) + "/" + escapeObjectPath(remotePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.endpoint+path, body)
 	if err != nil {
@@ -171,6 +187,16 @@ func (c *Client) PutObject(
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-Fabric-Grant", capability)
+	if ifMatch != "" {
+		// Normalise to a quoted value — S3-API providers expect ETag
+		// values quoted. Defensive: if the caller already quoted, don't
+		// double-quote.
+		v := ifMatch
+		if len(v) < 2 || v[0] != '"' || v[len(v)-1] != '"' {
+			v = `"` + v + `"`
+		}
+		req.Header.Set("If-Match", v)
+	}
 	return c.do(req, path)
 }
 

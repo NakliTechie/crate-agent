@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,6 +73,13 @@ type Config struct {
 	// it on push; the puller replaces it on pull. Mutex-guarded.
 	ManifestRef *manifest.Manifest
 	ManifestMu  *sync.Mutex
+
+	// ManifestETagRef + LastFlushedEventCountRef are shared with the
+	// syncer for M6.x If-Match conditional PUTs. The puller updates
+	// these on every successful manifest pull — bookkeeping for the
+	// syncer's next write.
+	ManifestETagRef          *string
+	LastFlushedEventCountRef *int
 
 	Hub   *httpc.Client
 	State *state.Store
@@ -117,6 +125,12 @@ func New(cfg Config) (*Puller, error) {
 	}
 	if cfg.ManifestMu == nil {
 		return nil, errors.New("puller: ManifestMu required")
+	}
+	if cfg.ManifestETagRef == nil {
+		return nil, errors.New("puller: ManifestETagRef required")
+	}
+	if cfg.LastFlushedEventCountRef == nil {
+		return nil, errors.New("puller: LastFlushedEventCountRef required")
 	}
 	if cfg.Hub == nil {
 		return nil, errors.New("puller: Hub required")
@@ -217,9 +231,12 @@ func (p *Puller) tick(ctx context.Context) {
 		return
 	}
 
-	// 3. Replace the shared in-memory manifest under the lock.
+	// 3. Replace the shared in-memory manifest under the lock + update
+	// the M6.x bookkeeping fields the syncer's putManifest depends on.
 	p.cfg.ManifestMu.Lock()
 	*p.cfg.ManifestRef = *fresh
+	*p.cfg.ManifestETagRef = strings.Trim(resp.ETag, `"`)
+	*p.cfg.LastFlushedEventCountRef = len(fresh.Events())
 	p.cfg.ManifestMu.Unlock()
 
 	// 4. Materialise + reconcile each entry.

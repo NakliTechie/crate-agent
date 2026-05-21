@@ -218,23 +218,29 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// --- Shared M3 manifest + master-key references ----------------------
 	// Both the puller and the syncer mutate the in-memory manifest; the
 	// refresh runner may rotate the master key. A single mutex guards the
-	// manifest; pointer indirection lets refresh swap keys without
-	// re-wiring downstream callers.
+	// manifest. M6.x adds two more shared fields — manifestETag (for
+	// If-Match conditional PUTs) and lastFlushedEventCount (snapshot for
+	// replay-on-412). The puller updates these on each successful pull;
+	// the syncer reads + updates them on each PUT.
 	sharedManifest := manifest.New()
 	sharedManifestMu := &sync.Mutex{}
+	sharedManifestETag := ""
+	sharedLastFlushedEventCount := 0
 
 	// --- Sync loop -------------------------------------------------------
 	syn, err := syncer.New(syncer.Config{
-		LocalPath:     cfg.Crate.LocalPath,
-		BucketID:      cfg.Crate.BucketID,
-		CapabilityRef: &liveCapability,
-		MasterKeyRef:  &masterKey,
-		ManifestRef:   sharedManifest,
-		ManifestMu:    sharedManifestMu,
-		Hub:           client,
-		Watcher:       w,
-		State:         store,
-		Logger:        slog.Default(),
+		LocalPath:                cfg.Crate.LocalPath,
+		BucketID:                 cfg.Crate.BucketID,
+		CapabilityRef:            &liveCapability,
+		MasterKeyRef:             &masterKey,
+		ManifestRef:              sharedManifest,
+		ManifestMu:               sharedManifestMu,
+		ManifestETagRef:          &sharedManifestETag,
+		LastFlushedEventCountRef: &sharedLastFlushedEventCount,
+		Hub:                      client,
+		Watcher:                  w,
+		State:                    store,
+		Logger:                   slog.Default(),
 	})
 	if err != nil {
 		return exitErr(exitGeneric, err)
@@ -255,15 +261,17 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// --- Pull loop (M3 — manifest-as-source-of-truth) --------------------
 	pul, err := puller.New(puller.Config{
-		LocalPath:     cfg.Crate.LocalPath,
-		BucketID:      cfg.Crate.BucketID,
-		CapabilityRef: &liveCapability,
-		MasterKeyRef:  &masterKey,
-		ManifestRef:   sharedManifest,
-		ManifestMu:    sharedManifestMu,
-		Hub:           client,
-		State:         store,
-		Logger:        slog.Default(),
+		LocalPath:                cfg.Crate.LocalPath,
+		BucketID:                 cfg.Crate.BucketID,
+		CapabilityRef:            &liveCapability,
+		MasterKeyRef:             &masterKey,
+		ManifestRef:              sharedManifest,
+		ManifestMu:               sharedManifestMu,
+		ManifestETagRef:          &sharedManifestETag,
+		LastFlushedEventCountRef: &sharedLastFlushedEventCount,
+		Hub:                      client,
+		State:                    store,
+		Logger:                   slog.Default(),
 	})
 	if err != nil {
 		return exitErr(exitGeneric, err)

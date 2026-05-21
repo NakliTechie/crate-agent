@@ -41,6 +41,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,6 +106,18 @@ type Config struct {
 	ManifestRef *manifest.Manifest
 	ManifestMu  *sync.Mutex
 
+	// ManifestETagRef tracks the last-known R2 ETag of the encrypted
+	// manifest. Pointer so the puller can update the same pointee.
+	// Pass &"" to start unconditional (the first PUT establishes the
+	// initial ETag). Mutex-guarded via ManifestMu.
+	ManifestETagRef *string
+
+	// LastFlushedEventCountRef tracks how many events were successfully
+	// flushed last time, so executePut's replay path knows which events
+	// are "ours" to re-append onto a fresh remote manifest after a 412.
+	// Mutex-guarded via ManifestMu.
+	LastFlushedEventCountRef *int
+
 	// Hub is the HTTP client pointed at the daemon's transport.
 	Hub *httpc.Client
 
@@ -159,6 +172,12 @@ func New(cfg Config) (*Syncer, error) {
 	}
 	if cfg.ManifestMu == nil {
 		return nil, errors.New("syncer: ManifestMu is required")
+	}
+	if cfg.ManifestETagRef == nil {
+		return nil, errors.New("syncer: ManifestETagRef is required")
+	}
+	if cfg.LastFlushedEventCountRef == nil {
+		return nil, errors.New("syncer: LastFlushedEventCountRef is required")
 	}
 	if cfg.Hub == nil {
 		return nil, errors.New("syncer: Hub client is required")
@@ -455,11 +474,12 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 		return fmt.Errorf("manifest append: %w", evtErr)
 	}
 	manifestBytes, err := s.cfg.ManifestRef.EncryptToBytes(masterKey)
+	appendedCount := len(s.cfg.ManifestRef.Events())
 	s.cfg.ManifestMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("manifest encrypt: %w", err)
 	}
-	if err := s.putManifest(ctx, manifestBytes, cap); err != nil {
+	if err := s.putManifest(ctx, manifestBytes, cap, appendedCount); err != nil {
 		return err
 	}
 
@@ -521,11 +541,12 @@ func (s *Syncer) executeDelete(ctx context.Context, row *state.QueueEntry) error
 		return fmt.Errorf("manifest append delete: %w", evtErr)
 	}
 	manifestBytes, err := s.cfg.ManifestRef.EncryptToBytes(masterKey)
+	appendedCount := len(s.cfg.ManifestRef.Events())
 	s.cfg.ManifestMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("manifest encrypt: %w", err)
 	}
-	if err := s.putManifest(ctx, manifestBytes, cap); err != nil {
+	if err := s.putManifest(ctx, manifestBytes, cap, appendedCount); err != nil {
 		return err
 	}
 
@@ -536,19 +557,98 @@ func (s *Syncer) executeDelete(ctx context.Context, row *state.QueueEntry) error
 }
 
 // putManifest is shared by executePut + executeDelete after they append
-// to the in-memory manifest.
-func (s *Syncer) putManifest(ctx context.Context, body []byte, cap string) error {
-	resp, err := s.cfg.Hub.PutObject(ctx, s.cfg.BucketID, manifest.Path,
-		bytesReader(body), int64(len(body)),
-		"application/octet-stream", cap)
-	if err != nil {
-		return fmt.Errorf("PUT manifest: %w", err)
-	}
-	if resp.Status < 200 || resp.Status >= 300 {
+// to the in-memory manifest. M6.x: PUTs with If-Match against the
+// last-known ETag; on 412 (a peer wrote between our snapshot and our
+// PUT) re-fetches the manifest, replays our local events on top, and
+// retries. Up to 3 retries before giving up.
+//
+// Caller passes `appendedEventCount` — the value of len(ManifestRef.events)
+// AFTER appending the local event(s) but BEFORE this call. We use this
+// to figure out which events are "ours to replay" in the event of a 412.
+func (s *Syncer) putManifest(ctx context.Context, body []byte, cap string, appendedEventCount int) error {
+	const maxRetries = 3
+	masterKey := *s.cfg.MasterKeyRef
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		s.cfg.ManifestMu.Lock()
+		ifMatch := *s.cfg.ManifestETagRef
+		s.cfg.ManifestMu.Unlock()
+
+		resp, err := s.cfg.Hub.PutObjectIfMatch(ctx, s.cfg.BucketID, manifest.Path,
+			bytesReader(body), int64(len(body)),
+			"application/octet-stream", ifMatch, cap)
+		if err != nil {
+			return fmt.Errorf("PUT manifest: %w", err)
+		}
+		if resp.Status >= 200 && resp.Status < 300 {
+			// Success — record the new ETag + bump the flushed-count.
+			s.cfg.ManifestMu.Lock()
+			*s.cfg.ManifestETagRef = strings.Trim(resp.ETag, `"`)
+			*s.cfg.LastFlushedEventCountRef = appendedEventCount
+			s.cfg.ManifestMu.Unlock()
+			return nil
+		}
+		if resp.Status == 412 && attempt < maxRetries {
+			s.logger.Info("manifest PUT 412; refetching + replaying local events",
+				"attempt", attempt+1)
+			// Re-GET + replay. Hold the lock for the whole replay so the
+			// puller (which also touches ManifestRef) can't race.
+			s.cfg.ManifestMu.Lock()
+			lastFlushed := *s.cfg.LastFlushedEventCountRef
+			// Snapshot the events we appended locally since the last flush.
+			localPending := make([]manifest.Event, 0, len(s.cfg.ManifestRef.Events())-lastFlushed)
+			for i := lastFlushed; i < len(s.cfg.ManifestRef.Events()); i++ {
+				e := s.cfg.ManifestRef.Events()[i]
+				clone := make(manifest.Event, len(e))
+				for k, v := range e {
+					if k == "v" || k == "ts" || k == "prev_sig" || k == "sig" {
+						continue
+					}
+					clone[k] = v
+				}
+				localPending = append(localPending, clone)
+			}
+			s.cfg.ManifestMu.Unlock()
+
+			got, err := s.cfg.Hub.GetObject(ctx, s.cfg.BucketID, manifest.Path, cap)
+			if err != nil {
+				return fmt.Errorf("re-GET manifest after 412: %w", err)
+			}
+			if got.Status < 200 || got.Status >= 300 {
+				return fmt.Errorf("re-GET manifest after 412: HTTP %d", got.Status)
+			}
+			fresh, err := manifest.LoadFromBytes(got.Body, masterKey)
+			if err != nil {
+				return fmt.Errorf("re-GET manifest after 412: decode: %w", err)
+			}
+			// Replace shared manifest + replay local events under lock.
+			s.cfg.ManifestMu.Lock()
+			// Mutate in place via setter methods. internal/manifest doesn't
+			// expose direct field writes; rebuild events through Append() so
+			// every replayed event has a fresh prev_sig chain.
+			*s.cfg.ManifestRef = *fresh
+			for _, partial := range localPending {
+				if _, aErr := s.cfg.ManifestRef.Append(partial, masterKey); aErr != nil {
+					s.cfg.ManifestMu.Unlock()
+					return fmt.Errorf("replay event: %w", aErr)
+				}
+			}
+			// Re-encrypt the merged manifest for next PUT.
+			newBody, err := s.cfg.ManifestRef.EncryptToBytes(masterKey)
+			if err != nil {
+				s.cfg.ManifestMu.Unlock()
+				return fmt.Errorf("re-encrypt manifest after replay: %w", err)
+			}
+			*s.cfg.ManifestETagRef = strings.Trim(got.ETag, `"`)
+			appendedEventCount = len(s.cfg.ManifestRef.Events())
+			s.cfg.ManifestMu.Unlock()
+			body = newBody
+			continue
+		}
 		return fmt.Errorf("PUT manifest: upstream HTTP %d (%s)",
 			resp.Status, envelopeMsg(resp))
 	}
-	return nil
+	return fmt.Errorf("PUT manifest: too many ETag-conflict retries")
 }
 
 // computeBackoff returns the next-attempt delay for an upload that has been
