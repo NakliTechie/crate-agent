@@ -277,7 +277,10 @@ func (p *Puller) reconcileOne(ctx context.Context, remotePath string, entry *man
 	if entry.IsDir {
 		// Folders are virtual — make sure the directory exists locally,
 		// then move on. No content to download.
-		localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(stripLeadingSlash(remotePath)))
+		localAbs, err := safeLocalJoin(p.cfg.LocalPath, remotePath)
+		if err != nil {
+			return fmt.Errorf("unsafe folder path from manifest: %w", err)
+		}
 		if err := os.MkdirAll(localAbs, 0o755); err != nil {
 			return fmt.Errorf("mkdir folder: %w", err)
 		}
@@ -297,7 +300,10 @@ func (p *Puller) reconcileOne(ctx context.Context, remotePath string, entry *man
 		return nil
 	}
 
-	localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(stripLeadingSlash(remotePath)))
+	localAbs, err := safeLocalJoin(p.cfg.LocalPath, remotePath)
+	if err != nil {
+		return fmt.Errorf("unsafe file path from manifest: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
 		return fmt.Errorf("mkdir parent: %w", err)
 	}
@@ -456,7 +462,10 @@ func (p *Puller) handleRemoteDelete(ctx context.Context, key string) error {
 	if cached == nil {
 		return nil
 	}
-	localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(stripLeadingSlash(key)))
+	localAbs, err := safeLocalJoin(p.cfg.LocalPath, key)
+	if err != nil {
+		return fmt.Errorf("unsafe remote-delete path: %w", err)
+	}
 	info, statErr := os.Stat(localAbs)
 	switch {
 	case errors.Is(statErr, os.ErrNotExist):
@@ -498,6 +507,62 @@ func stripLeadingSlash(s string) string {
 		return s[1:]
 	}
 	return s
+}
+
+// safeLocalJoin resolves a manifest path to an absolute on-disk path
+// guaranteed to live under root. Rejects:
+//   - absolute paths inside the manifest entry (e.g. "/etc/passwd")
+//   - any path containing ".." after normalisation
+//   - any final path that escapes root via symlinks (caught by EvalSymlinks
+//     of the parent dir; the file itself need not exist)
+//   - empty paths
+//
+// A malicious transport that serves a manifest with path
+// "../../.ssh/authorized_keys" would otherwise let the daemon write
+// outside ~/crate/. This is the only chokepoint between an attacker
+// who controls the manifest and arbitrary file writes on the user's
+// disk, so the check fails closed on any ambiguity.
+func safeLocalJoin(root, manifestPath string) (string, error) {
+	if manifestPath == "" {
+		return "", fmt.Errorf("manifest path is empty")
+	}
+	clean := stripLeadingSlash(manifestPath)
+	if clean == "" {
+		return "", fmt.Errorf("manifest path resolves to empty")
+	}
+	// Reject "..", ".", and any segment that escapes via path-clean
+	// rewriting. We do this on the slash-form before converting to OS
+	// separators so Windows paths don't smuggle ".." past us.
+	if strings.HasPrefix(clean, "/") || strings.Contains(clean, `\`) {
+		return "", fmt.Errorf("manifest path must be a relative slash-path: %q", manifestPath)
+	}
+	for _, seg := range strings.Split(clean, "/") {
+		if seg == ".." || seg == "." || seg == "" {
+			return "", fmt.Errorf("manifest path has unsafe segment %q in %q", seg, manifestPath)
+		}
+	}
+
+	joined := filepath.Join(root, filepath.FromSlash(clean))
+	// Re-clean and verify the result is still under root. filepath.Join
+	// already runs Clean, but we verify the prefix explicitly so a future
+	// refactor doesn't silently break this.
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve root: %w", err)
+	}
+	absJoined, err := filepath.Abs(joined)
+	if err != nil {
+		return "", fmt.Errorf("resolve joined: %w", err)
+	}
+	// Use Rel + check for "..\..\" prefix to be cross-platform-safe.
+	rel, err := filepath.Rel(absRoot, absJoined)
+	if err != nil {
+		return "", fmt.Errorf("rel check: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("manifest path escapes root: %q", manifestPath)
+	}
+	return absJoined, nil
 }
 
 func decodeB64(s string) ([]byte, error) {
