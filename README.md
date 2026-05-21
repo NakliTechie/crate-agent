@@ -4,6 +4,8 @@ A small Go daemon that keeps a local folder (`~/crate/` by default) in sync with
 
 **The daemon never holds your bucket credentials.** It authenticates to a transport (`nakli-hub` or `nakli-cf-worker`) via a pairing token issued by the browser Crate. That's a security property, not a layering accident — losing the daemon doesn't expose your R2 access keys.
 
+For an illustrated walk-through of pairing the daemon with your Crate folder, see the [user guide § The desktop daemon](https://crate.naklios.dev/guide/#daemon). What follows is the terse install + reference.
+
 ## Install
 
 The simplest path: download a prebuilt binary for your OS from the latest [release](https://github.com/NakliTechie/crate-agent/releases/latest).
