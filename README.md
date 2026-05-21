@@ -1,42 +1,143 @@
 # crate-agent
 
-A small Go binary that watches `~/crate/` and keeps it in sync with the user's Crate. Cloud is canonical, the daemon is a cache. **The daemon does not hold bucket credentials** — it authenticates to a transport (`nakli-hub` or `nakli-cf-worker`) via a pairing token issued by the browser Crate. This is a security property, not a layering accident.
+A small Go daemon that keeps a local folder (`~/crate/` by default) in sync with your [Crate](https://crate.naklios.dev/) cloud folder. Cloud is canonical; the daemon is a continuously-updated local mirror. macOS + Linux today; Windows is on the v1.x roadmap.
 
-Build target: single statically-linked Go binary per OS. v1.0 ships macOS + Linux; Windows is v1.1.
+**The daemon never holds your bucket credentials.** It authenticates to a transport (`nakli-hub` or `nakli-cf-worker`) via a pairing token issued by the browser Crate. That's a security property, not a layering accident — losing the daemon doesn't expose your R2 access keys.
 
-## Status
+## Install
 
-**M3 pieces 6 + 8 — the daemon is now a real daemon.** [`crate-agent start`](cmd/start.go) decrypts the configured capability with the folder passphrase, opens the SQLite state DB, starts the watcher on `local_path`, and runs the [sync loop](internal/syncer/) plus a [capability-refresh goroutine](internal/refresh/) until SIGINT/SIGTERM. The refresh runner POSTs `/v1/capability/refresh` when <20% of TTL remains, re-encrypts the new capability under the in-memory master key, and atomic-rewrites the config. [`crate-agent stop`](cmd/stop.go) reads the XDG pidfile (`$XDG_STATE_HOME/nakli/crate-agent.pid`), sends SIGTERM, and waits for graceful drain. [`crate-agent status`](cmd/status.go) reports running/stopped + queue depth + recent conflicts + capability expiry; `--json` for machine-readable output (no passphrase required — status reads state.db only). Crash-safe via [`internal/pidfile/`](internal/pidfile/) (atomic create with stale-file detection; refuses to start a second daemon over a live one with exit 4). 71 unit tests passing across `state` / `watcher` / `ignore` / `pairing` / `syncer` / `refresh` / `pidfile`. Smoke gate exercises a full start → status (running) → stop (graceful) → stop again (exit 5) → status (stopped) → `--json` round-trip in <2s.
-
-**Earlier**: M3 piece 5 (sync loop, push — [`890f25f`](https://github.com/NakliTechie/crate-agent/commit/890f25f)), M3 piece 2 (state DB + watcher + .crateignore — [`7d1e200`](https://github.com/NakliTechie/crate-agent/commit/7d1e200)), M2 (`pair` command end-to-end — [`9582743`](https://github.com/NakliTechie/crate-agent/commit/9582743)), M1 (wire audit + SDK binding + doctor — [`4748f01`](https://github.com/NakliTechie/crate-agent/commit/4748f01)). Remaining M3 pieces: 5b (pull-side + conflicting-rename) → M4, 7 (salt reconciliation), 10 (service-file generators). Stacked on the Hub-side bucket-proxy at [`private-mesh@dbec7e8`](https://github.com/NakliTechie/private-mesh/commit/dbec7e8). See [`docs/specs/crate-daemon-handoff-v1.0.md`](docs/specs/crate-daemon-handoff-v1.0.md), [`docs/wire-protocol-audit.md`](docs/wire-protocol-audit.md), and the [vision doc](../private-mesh/docs/specs/crate-vision-and-roadmap-v1.0.md) (in `private-mesh`).
-
-## Build
+The simplest path: download a prebuilt binary for your OS from the latest [release](https://github.com/NakliTechie/crate-agent/releases/latest).
 
 ```sh
-make all          # cross-compile to darwin amd64+arm64 + linux amd64+arm64
-./smoke.sh        # Full gate: builds nakli-hub + nakli-cli from ../private-mesh,
-                  # spins up Hub, mints a FIF, runs doctor (M1), then mints an
-                  # intent + runs `pair --token-stdin --passphrase-stdin` and
-                  # verifies the post-pair doctor is green (M2).
-                  # SKIP_M2=1 ./smoke.sh runs M0+M1 only.
-                  # SKIP_M1=1 ./smoke.sh runs M0 only.
+# macOS (Apple Silicon)
+curl -L -o crate-agent https://github.com/NakliTechie/crate-agent/releases/latest/download/crate-agent-darwin-arm64
+chmod +x crate-agent
+sudo mv crate-agent /usr/local/bin/
+
+# macOS (Intel)
+curl -L -o crate-agent https://github.com/NakliTechie/crate-agent/releases/latest/download/crate-agent-darwin-amd64
+chmod +x crate-agent && sudo mv crate-agent /usr/local/bin/
+
+# Linux (x86_64)
+curl -L -o crate-agent https://github.com/NakliTechie/crate-agent/releases/latest/download/crate-agent-linux-amd64
+chmod +x crate-agent && sudo mv crate-agent /usr/local/bin/
+
+# Linux (ARM64)
+curl -L -o crate-agent https://github.com/NakliTechie/crate-agent/releases/latest/download/crate-agent-linux-arm64
+chmod +x crate-agent && sudo mv crate-agent /usr/local/bin/
 ```
 
-## Pair flow
+Confirm the install:
 
 ```sh
-# Interactive (default):
+crate-agent version
+```
+
+Or build from source — single statically-linked binary, no CGO, no runtime dependencies:
+
+```sh
+make build              # current host only → dist/crate-agent
+make all                # cross-compile all four targets → dist/
+```
+
+## Quick start
+
+```sh
+# 1. Open your Crate in the browser (https://crate.naklios.dev/), unlock the
+#    folder, click "Pair an agent". The modal shows a CRATE-PAIR-… token.
+#    Copy it.
+
+# 2. Pair the daemon to that folder. You'll be prompted for the token
+#    + your folder passphrase.
 crate-agent pair
-# Paste pairing token: CRATE-PAIR-...
+# Paste pairing token: CRATE-PAIR-…
 # Folder passphrase: ********
+# ✓ Paired with crate-<bucket-name>
 
-# Non-interactive (testing):
-printf '%s\n%s\n' "$TOKEN" "$PASS" | crate-agent pair --token-stdin --passphrase-stdin
+# 3. Verify the install is healthy.
+crate-agent doctor
+
+# 4. Start syncing. Foreground first — Ctrl-C to stop.
+crate-agent start
+# Watching ~/crate, syncing to <bucket>…
 ```
 
-After a successful pair:
-- `~/.config/nakli/identity.key` (FIF, 0600) — daemon's ephemeral Ed25519 keypair, encrypted under the passphrase.
-- `~/.config/nakli/crate-agent.toml` (0600) — config with `pairing_token` = base64(XChaCha20-Poly1305(capability, master_key, nonce)), plus `salt`, `capability_nonce`, `transport_pubkey`, `capability_expires`.
+Drop a file into `~/crate/`, it encrypts + uploads. Edit a file in the browser, it downloads + decrypts to `~/crate/` within ~15 s. Bidirectional, byte-identical wire format on both sides.
+
+When you're happy with foreground behaviour, install as a long-running service:
+
+```sh
+crate-agent install-service      # launchd on macOS, systemd-user on Linux
+crate-agent status               # confirm it's running
+crate-agent uninstall-service    # remove the unit
+```
+
+## Commands
+
+| Command | What |
+|---|---|
+| `crate-agent pair` | Redeem a CRATE-PAIR-… token from the browser. Writes config + identity key. |
+| `crate-agent start` | Run the watcher + sync loop + capability-refresh runner. Ctrl-C to stop gracefully. |
+| `crate-agent stop` | Signal the running daemon to terminate (reads `$XDG_STATE_HOME/nakli/crate-agent.pid`, sends SIGTERM, waits for drain). |
+| `crate-agent status` | Process state + queue depth + recent conflicts + capability expiry. `--json` for machine-readable output. |
+| `crate-agent doctor` | Self-check: config valid, identity readable, transport reachable, state DB readable, watcher functional. |
+| `crate-agent install-service` | Generate + load a user-level supervisor unit. |
+| `crate-agent uninstall-service` | Remove the unit. |
+| `crate-agent version` | Version + build date + git SHA + Go runtime + OS/arch. |
+| `crate-agent --help` | Full command reference. |
+
+`status` doesn't need the folder passphrase — it reads daemon state only. Everything that touches encrypted bytes (`pair`, `start`, `doctor`) needs the passphrase.
+
+## How it works
+
+```
+              ┌──────────────┐                 ┌─────────────┐
+~/crate/  ◄──►│ crate-agent  │◄──── token ────►│  transport  │◄──── ciphertext ────► R2 / B2 / …
+              │ (Go daemon)  │                 │ (Hub or CF) │
+              └──────────────┘                 └─────────────┘
+                  ▲
+                  │  same encrypted bytes
+                  ▼
+        ┌────────────────────┐
+        │ browser Crate tab  │
+        │ at crate.naklios.dev │
+        └────────────────────┘
+```
+
+- **Watcher** (`internal/watcher/`) monitors `~/crate/` for changes via fsnotify; ignores files matching `.crateignore` patterns.
+- **Syncer** (`internal/syncer/`) walks the change queue, encrypts new/modified files under the master key, appends a signed manifest event, PUTs the ciphertext + the new manifest. ETag-conditional with replay-on-412 so concurrent writes from the browser don't clobber.
+- **Puller** (`internal/puller/`) polls the manifest every ~15 s, diffs against the local state, downloads + decrypts changed objects, writes to disk atomically.
+- **Refresh runner** (`internal/refresh/`) re-mints the daemon's transport capability when <20 % of TTL remains, re-encrypts under the in-memory master key, atomic-rewrites config.
+- **State DB** (`internal/state/`, SQLite via `mattn/go-sqlite3`) tracks per-file content hashes, the last-synced manifest UUID, the daemon's pending change queue. Crash-resumable.
+
+The wire format on the bucket is byte-identical to what the [browser Crate](https://github.com/NakliTechie/crate) reads and writes. The daemon has no way to read a folder the browser hasn't first set up; the browser has no need for the daemon. They're independent, interoperable surfaces over the same cryptographic invariant.
+
+## Files on disk
+
+| Path | Mode | What |
+|---|---|---|
+| `~/.config/nakli/crate-agent.toml` | 0600 | Config: encrypted capability + salt + nonce + transport endpoint |
+| `~/.config/nakli/identity.key` | 0600 | FIF-wrapped ephemeral Ed25519 keypair (unlocks with the folder passphrase) |
+| `$XDG_STATE_HOME/nakli/state.db` | 0600 | SQLite — change queue, content hashes, manifest cache |
+| `$XDG_STATE_HOME/nakli/crate-agent.pid` | 0644 | Pidfile (atomic create; stale-file detection) |
+| `~/crate/` | 0700 | The synced folder. Contents follow your bucket; ignore patterns in `.crateignore`. |
+
+Configurable via the TOML — the wizard's defaults work for most users.
+
+## Security model
+
+- **No bucket credentials on disk.** The daemon holds an encrypted transport capability — a macaroon scoped to your bucket's sync primitive. Losing the daemon leaks the capability (encrypted under your passphrase) but never your R2 access keys.
+- **Passphrase + identity key required to start.** `crate-agent start` decrypts the capability with the passphrase you set at pairing. No passphrase, no daemon. The master key lives only in the daemon process's memory.
+- **Capability refresh, not capability storage.** Capabilities have a 1-year TTL with auto-refresh at 80 %. Stolen capabilities can be revoked from the browser ("Pair an agent" → revoke device).
+- **AGPL-3.0-or-later.** The whole code path is auditable; transport contract is documented in [`docs/specs/`](docs/specs/) and the [crate-agent wire-protocol audit](docs/wire-protocol-audit.md).
+
+## Repos
+
+| | |
+|---|---|
+| Daemon (this) | [`NakliTechie/crate-agent`](https://github.com/NakliTechie/crate-agent) |
+| Browser surface | [`NakliTechie/crate`](https://github.com/NakliTechie/crate) — live at [crate.naklios.dev](https://crate.naklios.dev/) |
+| Transports + Hub | [`NakliTechie/private-mesh`](https://github.com/NakliTechie/private-mesh) |
 
 ## Licence
 

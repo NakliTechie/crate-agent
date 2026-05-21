@@ -402,4 +402,4 @@ if ! grep -qi "already absent" "$tmp/uninstall2.log"; then
 fi
 echo "  ✓ second uninstall reports already-absent"
 
-echo "OK: crate-agent (M2 + M3 pieces 6 + 7 + 8 + 10 — install-service round-trip)"
+echo "OK: crate-agent v1"
