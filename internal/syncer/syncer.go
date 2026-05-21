@@ -27,6 +27,7 @@
 package syncer
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -37,6 +38,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"mime"
 	"os"
 	"path/filepath"
 	"sync"
@@ -45,9 +47,40 @@ import (
 	"github.com/oklog/ulid/v2"
 
 	"github.com/NakliTechie/crate-agent/internal/httpc"
+	"github.com/NakliTechie/crate-agent/internal/manifest"
+	"github.com/NakliTechie/crate-agent/internal/payload"
 	"github.com/NakliTechie/crate-agent/internal/state"
 	"github.com/NakliTechie/crate-agent/internal/watcher"
 )
+
+// --- small helpers used by executePut / executeDelete --------------------
+
+func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
+
+func decodeB64(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
+}
+
+// decodeB64Must is used in tight paths where we BUILT the b64 ourselves and
+// know it's valid; panic indicates a programmer error not a runtime issue.
+func decodeB64Must(s string) []byte {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		panic("syncer.decodeB64Must: " + err.Error())
+	}
+	return b
+}
+
+func mimeFromName(name string) string {
+	ext := filepath.Ext(name)
+	if ext == "" {
+		return "application/octet-stream"
+	}
+	if m := mime.TypeByExtension(ext); m != "" {
+		return m
+	}
+	return "application/octet-stream"
+}
 
 // Config configures a Syncer.
 type Config struct {
@@ -57,9 +90,20 @@ type Config struct {
 	// BucketID is the daemon's bucket reference (returned by pair).
 	BucketID string
 
-	// Capability is the daemon's base64-encoded macaroon, used as the
-	// X-Fabric-Grant header on every Hub call.
-	Capability string
+	// CapabilityRef is dereferenced on each upload; refresh runner mutates
+	// the pointee in place when the capability rotates.
+	CapabilityRef *string
+
+	// MasterKeyRef is dereferenced on each upload. Salt reconciliation
+	// may have replaced the master key after pair-time.
+	MasterKeyRef *[]byte
+
+	// ManifestRef is the shared in-memory manifest (also held by the
+	// puller). Syncer appends events on push; reads back on push of
+	// modifications. Mutex-guarded — every read or mutation MUST hold
+	// ManifestMu.
+	ManifestRef *manifest.Manifest
+	ManifestMu  *sync.Mutex
 
 	// Hub is the HTTP client pointed at the daemon's transport.
 	Hub *httpc.Client
@@ -74,13 +118,10 @@ type Config struct {
 	Logger *slog.Logger
 
 	// PollInterval is how often the worker checks for due uploads. Default
-	// 250ms — tight enough to feel responsive after a quiet period; loose
-	// enough not to thrash the DB.
+	// 250ms.
 	PollInterval time.Duration
 
-	// BackoffBase + BackoffCap shape the exponential retry schedule for
-	// failed uploads. attempts=N delays N → min(BackoffBase * 2^(N-1), BackoffCap).
-	// Defaults: 1s base, 60s cap.
+	// BackoffBase + BackoffCap shape the exponential retry schedule.
 	BackoffBase time.Duration
 	BackoffCap  time.Duration
 
@@ -107,8 +148,17 @@ func New(cfg Config) (*Syncer, error) {
 	if cfg.BucketID == "" {
 		return nil, errors.New("syncer: BucketID is required")
 	}
-	if cfg.Capability == "" {
-		return nil, errors.New("syncer: Capability is required")
+	if cfg.CapabilityRef == nil {
+		return nil, errors.New("syncer: CapabilityRef is required")
+	}
+	if cfg.MasterKeyRef == nil {
+		return nil, errors.New("syncer: MasterKeyRef is required")
+	}
+	if cfg.ManifestRef == nil {
+		return nil, errors.New("syncer: ManifestRef is required")
+	}
+	if cfg.ManifestMu == nil {
+		return nil, errors.New("syncer: ManifestMu is required")
 	}
 	if cfg.Hub == nil {
 		return nil, errors.New("syncer: Hub client is required")
@@ -287,53 +337,141 @@ func (s *Syncer) executeRow(ctx context.Context, row *state.QueueEntry) error {
 	}
 }
 
+// executePut reads the local file, encrypts with a per-file data key
+// wrapped under the master key, PUTs the ciphertext to objects/{uuid},
+// appends a create-or-update event to the shared manifest, re-encrypts +
+// PUTs the manifest. All wire shapes match the browser's M3 lib/crate.js.
 func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
-	// Open the local file. If it's gone, treat as a delete (someone deleted
-	// the file between the Watcher event and now). Re-enqueue isn't needed
-	// because the delete event would have been emitted separately if the
-	// file was actually removed via the FS API.
-	f, err := os.Open(row.LocalPath)
+	plain, err := os.ReadFile(row.LocalPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// Silently treat missing file as success — the next sync pass
-			// will pick up the actual delete event from the watcher.
+			// File vanished between watcher event and now. The matching
+			// delete event from the watcher will land separately.
 			s.logger.Debug("PUT target missing (likely deleted); skipping", "rel", row.RemotePath)
 			return nil
 		}
-		return fmt.Errorf("open %s: %w", row.LocalPath, err)
+		return fmt.Errorf("read %s: %w", row.LocalPath, err)
 	}
-	defer f.Close()
-
-	info, err := f.Stat()
+	info, err := os.Stat(row.LocalPath)
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", row.LocalPath, err)
 	}
 	if info.IsDir() {
-		// Watcher should have filtered this; defensive skip.
 		return nil
 	}
 
-	// Compute SHA-256 + size by streaming once through a TeeReader. We need
-	// the SHA in manifest_cache; we also need to ship the bytes. Avoids a
-	// second open + read.
-	hasher := sha256.New()
-	rd := io.TeeReader(f, hasher)
+	cap := *s.cfg.CapabilityRef
+	masterKey := *s.cfg.MasterKeyRef
+	if cap == "" || len(masterKey) == 0 {
+		return errors.New("syncer: daemon not ready (capability or master key empty)")
+	}
 
-	resp, err := s.cfg.Hub.PutObject(ctx, s.cfg.BucketID, row.RemotePath,
-		rd, info.Size(), "", s.cfg.Capability)
+	// Manifest path is the row.RemotePath with a leading slash (matching
+	// the browser's convention). The manifest_cache stores rows without
+	// the leading slash; reconcile both.
+	manifestPath := "/" + row.RemotePath
+
+	// Decide create vs update under the manifest lock.
+	s.cfg.ManifestMu.Lock()
+	tree := s.cfg.ManifestRef.Materialise()
+	existing := tree[manifestPath]
+	s.cfg.ManifestMu.Unlock()
+
+	var uuid, dataKeyIVB64, dataKeyCTB64 string
+	var dataKey []byte
+	if existing != nil && !existing.IsDir && existing.UUID != "" {
+		// Update: reuse data key by unwrapping.
+		uuid = existing.UUID
+		ivBytes, err := decodeB64(existing.DataKeyIV)
+		if err != nil {
+			return fmt.Errorf("decode data_key_iv: %w", err)
+		}
+		ctBytes, err := decodeB64(existing.DataKeyCT)
+		if err != nil {
+			return fmt.Errorf("decode data_key_ct: %w", err)
+		}
+		dataKey, err = payload.UnwrapDataKey(masterKey, ivBytes, ctBytes, uuid)
+		if err != nil {
+			return fmt.Errorf("unwrap data key: %w", err)
+		}
+		dataKeyIVB64 = existing.DataKeyIV
+		dataKeyCTB64 = existing.DataKeyCT
+	} else {
+		// Create: fresh uuid + data key.
+		uuid = "01" + newULID()[:24]
+		dataKey, err = payload.RandomDataKey()
+		if err != nil {
+			return fmt.Errorf("random data key: %w", err)
+		}
+		var dataKeyIV, dataKeyCT []byte
+		dataKeyIV, dataKeyCT, err = payload.WrapDataKey(masterKey, dataKey, uuid)
+		if err != nil {
+			return fmt.Errorf("wrap data key: %w", err)
+		}
+		dataKeyIVB64 = base64.StdEncoding.EncodeToString(dataKeyIV)
+		dataKeyCTB64 = base64.StdEncoding.EncodeToString(dataKeyCT)
+	}
+	defer payload.Zero(dataKey)
+
+	// Encrypt the payload.
+	contentIV, body, err := payload.SealFilePayload(dataKey, plain, uuid)
 	if err != nil {
-		return fmt.Errorf("PUT %s: %w", row.RemotePath, err)
+		return fmt.Errorf("seal payload: %w", err)
+	}
+
+	// PUT objects/{uuid}
+	resp, err := s.cfg.Hub.PutObject(ctx, s.cfg.BucketID,
+		"objects/"+uuid, bytesReader(body), int64(len(body)),
+		"application/octet-stream", cap)
+	if err != nil {
+		return fmt.Errorf("PUT %s: %w", uuid, err)
 	}
 	if resp.Status < 200 || resp.Status >= 300 {
 		return fmt.Errorf("PUT %s: upstream HTTP %d (%s)",
-			row.RemotePath, resp.Status, envelopeMsg(resp))
+			uuid, resp.Status, envelopeMsg(resp))
 	}
 
+	// Append manifest event + flush.
+	s.cfg.ManifestMu.Lock()
+	var evtErr error
+	if existing != nil && !existing.IsDir && existing.UUID != "" {
+		_, evtErr = s.cfg.ManifestRef.Append(
+			manifest.UpdateEvent(uuid, int64(len(plain)), contentIV),
+			masterKey,
+		)
+	} else {
+		_, evtErr = s.cfg.ManifestRef.Append(
+			manifest.CreateEvent(uuid, manifestPath, int64(len(plain)),
+				mimeFromName(row.RemotePath),
+				decodeB64Must(dataKeyIVB64),
+				decodeB64Must(dataKeyCTB64),
+				contentIV,
+			),
+			masterKey,
+		)
+	}
+	if evtErr != nil {
+		s.cfg.ManifestMu.Unlock()
+		return fmt.Errorf("manifest append: %w", evtErr)
+	}
+	manifestBytes, err := s.cfg.ManifestRef.EncryptToBytes(masterKey)
+	s.cfg.ManifestMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("manifest encrypt: %w", err)
+	}
+	if err := s.putManifest(ctx, manifestBytes, cap); err != nil {
+		return err
+	}
+
+	// Update local cache.
+	sum := sha256.Sum256(plain)
 	if err := s.cfg.State.UpsertManifestEntry(ctx, state.ManifestEntry{
 		RemotePath:   row.RemotePath,
-		ETag:         resp.ETag,
-		SHA256:       hex.EncodeToString(hasher.Sum(nil)),
-		SizeBytes:    info.Size(),
+		UUID:         uuid,
+		ContentIV:    base64.StdEncoding.EncodeToString(contentIV),
+		ETag:         uuid + ":" + base64.StdEncoding.EncodeToString(contentIV),
+		SHA256:       hex.EncodeToString(sum[:]),
+		SizeBytes:    int64(len(plain)),
 		LastModified: s.now().UTC(),
 		LocalMtimeNS: info.ModTime().UnixNano(),
 	}); err != nil {
@@ -343,18 +481,72 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 }
 
 func (s *Syncer) executeDelete(ctx context.Context, row *state.QueueEntry) error {
-	resp, err := s.cfg.Hub.DeleteObject(ctx, s.cfg.BucketID, row.RemotePath, s.cfg.Capability)
-	if err != nil {
-		return fmt.Errorf("DELETE %s: %w", row.RemotePath, err)
+	cap := *s.cfg.CapabilityRef
+	masterKey := *s.cfg.MasterKeyRef
+	if cap == "" || len(masterKey) == 0 {
+		return errors.New("syncer: daemon not ready")
 	}
-	// 204 (success) and 404 (already gone) both count as "the desired state
-	// is achieved." Anything else is a real error.
+
+	manifestPath := "/" + row.RemotePath
+
+	// Find uuid under manifest lock.
+	s.cfg.ManifestMu.Lock()
+	tree := s.cfg.ManifestRef.Materialise()
+	existing := tree[manifestPath]
+	s.cfg.ManifestMu.Unlock()
+
+	if existing == nil || existing.IsDir || existing.UUID == "" {
+		// Nothing to delete remotely — clear cache (if any) and move on.
+		if err := s.cfg.State.DeleteManifestEntry(ctx, row.RemotePath); err != nil {
+			s.logger.Warn("DeleteManifestEntry failed", "err", err)
+		}
+		return nil
+	}
+
+	// DELETE objects/{uuid}
+	resp, err := s.cfg.Hub.DeleteObject(ctx, s.cfg.BucketID, "objects/"+existing.UUID, cap)
+	if err != nil {
+		return fmt.Errorf("DELETE %s: %w", existing.UUID, err)
+	}
 	if resp.Status != 204 && resp.Status != 200 && resp.Status != 404 {
 		return fmt.Errorf("DELETE %s: upstream HTTP %d (%s)",
-			row.RemotePath, resp.Status, envelopeMsg(resp))
+			existing.UUID, resp.Status, envelopeMsg(resp))
 	}
+
+	// Append manifest delete + flush.
+	s.cfg.ManifestMu.Lock()
+	_, evtErr := s.cfg.ManifestRef.Append(manifest.DeleteEvent(existing.UUID), masterKey)
+	if evtErr != nil {
+		s.cfg.ManifestMu.Unlock()
+		return fmt.Errorf("manifest append delete: %w", evtErr)
+	}
+	manifestBytes, err := s.cfg.ManifestRef.EncryptToBytes(masterKey)
+	s.cfg.ManifestMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("manifest encrypt: %w", err)
+	}
+	if err := s.putManifest(ctx, manifestBytes, cap); err != nil {
+		return err
+	}
+
 	if err := s.cfg.State.DeleteManifestEntry(ctx, row.RemotePath); err != nil {
 		s.logger.Error("DeleteManifestEntry failed (delete succeeded)", "err", err)
+	}
+	return nil
+}
+
+// putManifest is shared by executePut + executeDelete after they append
+// to the in-memory manifest.
+func (s *Syncer) putManifest(ctx context.Context, body []byte, cap string) error {
+	resp, err := s.cfg.Hub.PutObject(ctx, s.cfg.BucketID, manifest.Path,
+		bytesReader(body), int64(len(body)),
+		"application/octet-stream", cap)
+	if err != nil {
+		return fmt.Errorf("PUT manifest: %w", err)
+	}
+	if resp.Status < 200 || resp.Status >= 300 {
+		return fmt.Errorf("PUT manifest: upstream HTTP %d (%s)",
+			resp.Status, envelopeMsg(resp))
 	}
 	return nil
 }

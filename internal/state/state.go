@@ -72,6 +72,14 @@ CREATE TABLE watcher_state (
     updated_at TEXT NOT NULL
 );
 `,
+	// 2: M3 daemon encryption catch-up — manifest_cache columns for the new
+	// "manifest as source of truth" reconciliation loop. Both columns are
+	// additive + nullable so the existing rows survive untouched.
+	`
+ALTER TABLE manifest_cache ADD COLUMN uuid TEXT;
+ALTER TABLE manifest_cache ADD COLUMN content_iv TEXT;
+CREATE INDEX idx_manifest_uuid ON manifest_cache(uuid);
+`,
 }
 
 // Store is the open SQLite connection + a clock for testable timestamps.
@@ -154,8 +162,19 @@ func DefaultPath(crateLocalPath string) string {
 // --- manifest_cache --------------------------------------------------------
 
 // ManifestEntry is one row in manifest_cache.
+//
+// M3-era fields (added by migration v2):
+//   UUID + ContentIV identify the canonical encrypted version on the
+//   bucket — the (UUID, ContentIV) pair changes whenever the file's
+//   content changes, so the puller compares against these to decide
+//   whether to re-download.
+//
+// The older ETag/SHA256 fields are preserved for backward-compat but
+// no longer load-bearing post-M3.
 type ManifestEntry struct {
 	RemotePath   string
+	UUID         string
+	ContentIV    string // base64
 	ETag         string
 	SHA256       string
 	SizeBytes    int64
@@ -174,24 +193,37 @@ func (s *Store) UpsertManifestEntry(ctx context.Context, e ManifestEntry) error 
 	}
 	_, err := s.db.ExecContext(ctx, `
         INSERT INTO manifest_cache (remote_path, etag, sha256, size_bytes,
-                                    last_modified, local_mtime_ns, cached_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+                                    last_modified, local_mtime_ns, cached_at,
+                                    uuid, content_iv)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(remote_path) DO UPDATE SET
             etag           = excluded.etag,
             sha256         = excluded.sha256,
             size_bytes     = excluded.size_bytes,
             last_modified  = excluded.last_modified,
             local_mtime_ns = excluded.local_mtime_ns,
-            cached_at      = excluded.cached_at`,
+            cached_at      = excluded.cached_at,
+            uuid           = excluded.uuid,
+            content_iv     = excluded.content_iv`,
 		e.RemotePath, e.ETag, e.SHA256, e.SizeBytes,
 		e.LastModified.UTC().Format(time.RFC3339Nano),
 		e.LocalMtimeNS,
 		e.CachedAt.Format(time.RFC3339Nano),
+		nullIfEmpty(e.UUID), nullIfEmpty(e.ContentIV),
 	)
 	if err != nil {
 		return fmt.Errorf("UpsertManifestEntry: %w", err)
 	}
 	return nil
+}
+
+// nullIfEmpty returns sql.NullString{Valid: false} for empty input — so
+// migration v2's nullable columns don't get spammed with "" rows.
+func nullIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // LookupManifestEntry returns the row for remote_path or (nil, nil) if absent.
@@ -202,18 +234,26 @@ func (s *Store) LookupManifestEntry(ctx context.Context, remotePath string) (*Ma
 		e            ManifestEntry
 		lastModified string
 		cachedAt     string
+		uuidNS       sql.NullString
+		civNS        sql.NullString
 	)
 	err := s.db.QueryRowContext(ctx, `
         SELECT remote_path, etag, sha256, size_bytes, last_modified,
-               local_mtime_ns, cached_at
+               local_mtime_ns, cached_at, uuid, content_iv
         FROM manifest_cache WHERE remote_path = ?`, remotePath,
 	).Scan(&e.RemotePath, &e.ETag, &e.SHA256, &e.SizeBytes,
-		&lastModified, &e.LocalMtimeNS, &cachedAt)
+		&lastModified, &e.LocalMtimeNS, &cachedAt, &uuidNS, &civNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("LookupManifestEntry: %w", err)
+	}
+	if uuidNS.Valid {
+		e.UUID = uuidNS.String
+	}
+	if civNS.Valid {
+		e.ContentIV = civNS.String
 	}
 	if t, perr := time.Parse(time.RFC3339Nano, lastModified); perr == nil {
 		e.LastModified = t

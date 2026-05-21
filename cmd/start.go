@@ -23,6 +23,7 @@ import (
 	"github.com/NakliTechie/crate-agent/internal/cratejson"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
 	"github.com/NakliTechie/crate-agent/internal/kdf"
+	"github.com/NakliTechie/crate-agent/internal/manifest"
 	"github.com/NakliTechie/crate-agent/internal/pidfile"
 	"github.com/NakliTechie/crate-agent/internal/puller"
 	"github.com/NakliTechie/crate-agent/internal/refresh"
@@ -214,15 +215,26 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	zeroBytes(capabilityBytes)
 	passphraseForReconcile = ""
 
+	// --- Shared M3 manifest + master-key references ----------------------
+	// Both the puller and the syncer mutate the in-memory manifest; the
+	// refresh runner may rotate the master key. A single mutex guards the
+	// manifest; pointer indirection lets refresh swap keys without
+	// re-wiring downstream callers.
+	sharedManifest := manifest.New()
+	sharedManifestMu := &sync.Mutex{}
+
 	// --- Sync loop -------------------------------------------------------
 	syn, err := syncer.New(syncer.Config{
-		LocalPath:  cfg.Crate.LocalPath,
-		BucketID:   cfg.Crate.BucketID,
-		Capability: liveCapability,
-		Hub:        client,
-		Watcher:    w,
-		State:      store,
-		Logger:     slog.Default(),
+		LocalPath:     cfg.Crate.LocalPath,
+		BucketID:      cfg.Crate.BucketID,
+		CapabilityRef: &liveCapability,
+		MasterKeyRef:  &masterKey,
+		ManifestRef:   sharedManifest,
+		ManifestMu:    sharedManifestMu,
+		Hub:           client,
+		Watcher:       w,
+		State:         store,
+		Logger:        slog.Default(),
 	})
 	if err != nil {
 		return exitErr(exitGeneric, err)
@@ -241,11 +253,14 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		return exitErr(exitGeneric, err)
 	}
 
-	// --- Pull loop (M3 piece 5b) -----------------------------------------
+	// --- Pull loop (M3 — manifest-as-source-of-truth) --------------------
 	pul, err := puller.New(puller.Config{
 		LocalPath:     cfg.Crate.LocalPath,
 		BucketID:      cfg.Crate.BucketID,
 		CapabilityRef: &liveCapability,
+		MasterKeyRef:  &masterKey,
+		ManifestRef:   sharedManifest,
+		ManifestMu:    sharedManifestMu,
 		Hub:           client,
 		State:         store,
 		Logger:        slog.Default(),

@@ -1,39 +1,42 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// Package puller implements the pull side of crate-agent's sync loop.
-// It periodically LISTs the bucket via the Hub bucket-proxy and reconciles
-// remote state into the local folder:
+// Package puller implements the pull side of crate-agent's sync loop in
+// the M3 (encrypted) wire format. The bucket holds:
 //
-//   - Remote object missing locally  → download
-//   - Remote ETag differs from cache → download (unless local was modified
-//                                       since last sync → conflict-rename)
-//   - Locally-tracked path NOT in latest LIST → remote deletion; remove
-//                                       the local file (unless modified
-//                                       locally since last sync → conflict)
+//   .crate/crate.json                — salt + version metadata (cleartext)
+//   .crate/manifest.jsonl.enc        — encrypted signed JSONL event log
+//   objects/{uuid}                   — encrypted file payloads
 //
-// Conflict resolution (Dropbox-style): the cloud version is canonical at
-// the original path; the divergent local copy is renamed to
-// `<file>.conflict-<rfc3339>.local`. A row is appended to conflict_log
-// and surfaced in `crate-agent status`. Never silently destroys work.
+// Manifest is the source of truth — the puller no longer LISTs the
+// bucket. Every tick:
 //
-// Push-side echo suppression: when the syncer just PUT a file, that file
-// will show up in the next LIST with a matching ETag. The puller compares
-// ETag-vs-manifest_cache so it correctly identifies "no change needed."
-// No special-case echo logic is required.
+//   1. GET .crate/manifest.jsonl.enc
+//   2. AES-GCM-decrypt + parse JSONL
+//   3. Verify the prev_sig chain
+//   4. Materialise the tree
+//   5. For each entry: compare against manifest_cache (uuid + content_iv);
+//      mismatch ⇒ GET objects/{uuid}, unwrap data key, decrypt payload,
+//      atomic-write to disk at the canonical path
+//   6. For each cached row NOT in the materialised tree ⇒ remote tombstone;
+//      remove the local copy (unless local was modified since last sync,
+//      in which case keep local + log conflict)
+//
+// Conflict-rename + remote-deleted-local-kept logic carries over from the
+// pre-M3 puller; only the source-of-truth comparison changed.
 package puller
 
 import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	b64 "encoding/base64"
 	"encoding/hex"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,24 +44,34 @@ import (
 
 	"github.com/NakliTechie/crate-agent/internal/cratejson"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
+	"github.com/NakliTechie/crate-agent/internal/manifest"
+	"github.com/NakliTechie/crate-agent/internal/payload"
 	"github.com/NakliTechie/crate-agent/internal/state"
 )
 
-// DefaultPollInterval is how often the puller LISTs the bucket. 15s is the
-// balance the M3 plan landed on: tight enough that a change made elsewhere
-// shows up within a minute; loose enough not to thrash the bucket-proxy.
 const DefaultPollInterval = 15 * time.Second
 
-// Config configures a Puller. CapabilityRef is shared with the syncer +
-// refresh runner so all three see the same capability after a refresh.
+const ObjectsPrefix = "objects/"
+
+// Config configures a Puller. MasterKeyRef is shared with the syncer +
+// refresh runner so all three see the same master key (refresh may
+// rotate it during reconciliation).
 type Config struct {
 	LocalPath string
 	BucketID  string
 
-	// CapabilityRef is a pointer the puller dereferences on each LIST so it
-	// always uses the freshest capability (the refresh runner mutates the
-	// pointee in place). Caller is responsible for the pointer's lifetime.
+	// CapabilityRef is dereferenced on each tick — refresh runner mutates
+	// the pointee on capability rotation.
 	CapabilityRef *string
+
+	// MasterKeyRef is dereferenced on each tick — salt reconciliation
+	// may have replaced the master key after pair-time.
+	MasterKeyRef *[]byte
+
+	// ManifestRef is the shared in-memory manifest. The syncer mutates
+	// it on push; the puller replaces it on pull. Mutex-guarded.
+	ManifestRef *manifest.Manifest
+	ManifestMu  *sync.Mutex
 
 	Hub   *httpc.Client
 	State *state.Store
@@ -67,15 +80,11 @@ type Config struct {
 	Logger       *slog.Logger
 	Now          func() time.Time
 
-	// LastSyncSlackNs is the "treat local mtime as ahead of cache by this
-	// many ns or less" tolerance. Default: 1 second. Filesystems have
-	// quantised mtimes (HFS+ has 1s resolution; ext4 ns; APFS ns) and we
-	// don't want false-positive conflicts from sub-second jitter when the
-	// daemon's own PUT path raced with a touch.
+	// LastSyncSlackNs — see pre-M3 docstring.
 	LastSyncSlackNs int64
 }
 
-// Puller drives the periodic LIST + reconciliation loop.
+// Puller drives the periodic pull-side reconciliation loop.
 type Puller struct {
 	cfg          Config
 	logger       *slog.Logger
@@ -83,14 +92,13 @@ type Puller struct {
 	pollInterval time.Duration
 	slackNs      int64
 
-	// Stats for `status` visibility (atomic).
-	listCalls   atomic.Int64
-	downloaded  atomic.Int64
-	conflicts   atomic.Int64
+	// Stats for `status`.
+	listCalls    atomic.Int64
+	downloaded   atomic.Int64
+	conflicts    atomic.Int64
 	deletedLocal atomic.Int64
 }
 
-// New validates Config and returns a Puller.
 func New(cfg Config) (*Puller, error) {
 	if cfg.LocalPath == "" {
 		return nil, errors.New("puller: LocalPath required")
@@ -100,6 +108,15 @@ func New(cfg Config) (*Puller, error) {
 	}
 	if cfg.CapabilityRef == nil {
 		return nil, errors.New("puller: CapabilityRef required")
+	}
+	if cfg.MasterKeyRef == nil {
+		return nil, errors.New("puller: MasterKeyRef required")
+	}
+	if cfg.ManifestRef == nil {
+		return nil, errors.New("puller: ManifestRef required")
+	}
+	if cfg.ManifestMu == nil {
+		return nil, errors.New("puller: ManifestMu required")
 	}
 	if cfg.Hub == nil {
 		return nil, errors.New("puller: Hub required")
@@ -129,14 +146,9 @@ func New(cfg Config) (*Puller, error) {
 	return p, nil
 }
 
-// Run polls until ctx is cancelled. Each tick: LIST the bucket, reconcile
-// each entry, then check tombstones (locally-tracked paths NOT in the LIST
-// result). Errors are logged but don't crash the loop — the next tick retries.
 func (p *Puller) Run(ctx context.Context) {
 	tick := time.NewTicker(p.pollInterval)
 	defer tick.Stop()
-	// Fire once immediately so a freshly-started daemon converges before
-	// the first poll interval elapses.
 	p.tick(ctx)
 	for {
 		select {
@@ -148,7 +160,6 @@ func (p *Puller) Run(ctx context.Context) {
 	}
 }
 
-// Stats returns counters useful for `status`.
 type Stats struct {
 	ListCalls    int64
 	Downloaded   int64
@@ -165,79 +176,244 @@ func (p *Puller) Stats() Stats {
 	}
 }
 
+// tick is one reconciliation pass: GET manifest, materialise, reconcile.
 func (p *Puller) tick(ctx context.Context) {
-	remote, err := p.listAll(ctx)
+	cap := *p.cfg.CapabilityRef
+	mk := *p.cfg.MasterKeyRef
+	if cap == "" || len(mk) == 0 {
+		// Daemon not ready (capability unset / master key not yet derived).
+		// Skip silently; next tick retries.
+		return
+	}
+
+	// 1. GET manifest.
+	resp, err := p.cfg.Hub.GetObject(ctx, p.cfg.BucketID, manifest.Path, cap)
 	if err != nil {
-		p.logger.Warn("LIST failed; will retry", "err", err)
+		p.logger.Warn("manifest GET failed", "err", err)
 		return
 	}
 	p.listCalls.Add(1)
-
-	// Build a set for tombstone detection.
-	seen := make(map[string]struct{}, len(remote))
-	for _, e := range remote {
-		seen[e.Key] = struct{}{}
-		// Skip the metadata blob — that's the browser's territory.
-		if e.Key == cratejson.CratePath {
-			continue
+	var fresh *manifest.Manifest
+	if resp.Status == http.StatusNotFound {
+		// Manifest absent — treat as empty (browser hasn't done first-time
+		// setup yet OR daemon is the first writer).
+		fresh = manifest.New()
+	} else if resp.Status >= 200 && resp.Status < 300 {
+		fresh, err = manifest.LoadFromBytes(resp.Body, mk)
+		if err != nil {
+			p.logger.Warn("manifest decrypt/parse failed", "err", err)
+			return
 		}
-		if err := p.reconcileOne(ctx, e); err != nil {
-			p.logger.Warn("reconcile failed",
-				"key", e.Key, "err", err)
+	} else {
+		p.logger.Warn("manifest GET non-2xx", "status", resp.Status)
+		return
+	}
+
+	// 2. Verify sig chain (defence-in-depth; rejects tampered manifests
+	// even if the AES-GCM auth tag was valid for some reason).
+	if ok, idx, reason := fresh.Verify(mk); !ok {
+		p.logger.Warn("manifest sig chain invalid; refusing to apply",
+			"idx", idx, "reason", reason)
+		return
+	}
+
+	// 3. Replace the shared in-memory manifest under the lock.
+	p.cfg.ManifestMu.Lock()
+	*p.cfg.ManifestRef = *fresh
+	p.cfg.ManifestMu.Unlock()
+
+	// 4. Materialise + reconcile each entry.
+	tree := fresh.Materialise()
+	// seenPaths uses the same no-leading-slash form as manifest_cache.RemotePath
+	// so tombstone detection compares apples-to-apples.
+	seenPaths := make(map[string]struct{}, len(tree))
+	for path, entry := range tree {
+		seenPaths[stripLeadingSlash(path)] = struct{}{}
+		if path == cratejson.CratePath || path == manifest.Path {
+			continue // skip metadata paths
+		}
+		if err := p.reconcileOne(ctx, path, entry, mk, cap); err != nil {
+			p.logger.Warn("reconcile failed", "path", path, "err", err)
 		}
 	}
 
-	// Tombstone pass: any manifest_cache row NOT in `seen` means the remote
-	// has deleted that key.
+	// 5. Tombstone detection: any manifest_cache row whose path isn't in
+	// the new manifest means the remote has deleted (or never had) it.
 	allCached, err := p.allCachedKeys(ctx)
 	if err != nil {
 		p.logger.Warn("walk manifest_cache failed", "err", err)
 		return
 	}
 	for _, key := range allCached {
-		if _, present := seen[key]; present {
+		if _, present := seenPaths[key]; present {
 			continue
 		}
 		if err := p.handleRemoteDelete(ctx, key); err != nil {
-			p.logger.Warn("remote-delete handling failed",
-				"key", key, "err", err)
+			p.logger.Warn("remote-delete handling failed", "key", key, "err", err)
 		}
 	}
 }
 
-// listAll walks the full LIST result via continuation_token pagination.
-func (p *Puller) listAll(ctx context.Context) ([]listEntry, error) {
-	var out []listEntry
-	cap := *p.cfg.CapabilityRef
-	if cap == "" {
-		return nil, errors.New("CapabilityRef is empty (daemon not ready)")
+// reconcileOne decides "no-op," "download," or "conflict + download" for
+// one materialised manifest entry.
+func (p *Puller) reconcileOne(ctx context.Context, remotePath string, entry *manifest.Entry, masterKey []byte, cap string) error {
+	if entry.IsDir {
+		// Folders are virtual — make sure the directory exists locally,
+		// then move on. No content to download.
+		localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(stripLeadingSlash(remotePath)))
+		if err := os.MkdirAll(localAbs, 0o755); err != nil {
+			return fmt.Errorf("mkdir folder: %w", err)
+		}
+		return nil
 	}
-	continuation := ""
-	for {
-		resp, err := p.cfg.Hub.ListObjects(ctx, p.cfg.BucketID, "", continuation, cap)
-		if err != nil {
-			return nil, fmt.Errorf("LIST: %w", err)
-		}
-		if resp.Status < 200 || resp.Status >= 300 {
-			return nil, fmt.Errorf("LIST: HTTP %d", resp.Status)
-		}
-		parsed, err := parseListXML(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("LIST: parse: %w", err)
-		}
-		out = append(out, parsed.Contents...)
-		if !parsed.IsTruncated || parsed.NextContinuationToken == "" {
-			return out, nil
-		}
-		continuation = parsed.NextContinuationToken
+
+	// manifest_cache stores paths WITHOUT leading slash; the manifest's
+	// `path` field carries it. Normalise on lookup so the no-op fast path
+	// actually fires on the second tick.
+	cacheKey := stripLeadingSlash(remotePath)
+	cached, err := p.cfg.State.LookupManifestEntry(ctx, cacheKey)
+	if err != nil {
+		return fmt.Errorf("lookup cache: %w", err)
 	}
+	// 99% fast path: same uuid + same content_iv ⇒ no-op.
+	if cached != nil && cached.UUID == entry.UUID && cached.ContentIV == entry.ContentIV {
+		return nil
+	}
+
+	localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(stripLeadingSlash(remotePath)))
+	if err := os.MkdirAll(filepath.Dir(localAbs), 0o755); err != nil {
+		return fmt.Errorf("mkdir parent: %w", err)
+	}
+
+	// Conflict check: if the local mtime is ahead of what we last synced,
+	// user modified locally while remote also changed → conflicting-rename.
+	if cached != nil {
+		if conflicted, err := p.localChangedSinceSync(localAbs, cached); err != nil {
+			return fmt.Errorf("conflict check: %w", err)
+		} else if conflicted {
+			if err := p.conflictingRename(ctx, localAbs, remotePath); err != nil {
+				return fmt.Errorf("conflicting-rename: %w", err)
+			}
+		}
+	}
+
+	return p.downloadAndDecrypt(ctx, entry, localAbs, masterKey, cap)
 }
 
-// allCachedKeys returns every remote_path in manifest_cache. Used for
-// tombstone detection.
+// downloadAndDecrypt does the work: GET objects/{uuid}, unwrap data key,
+// decrypt payload, atomic-write to disk, update manifest_cache.
+func (p *Puller) downloadAndDecrypt(ctx context.Context, entry *manifest.Entry, localAbs string, masterKey []byte, cap string) error {
+	got, err := p.cfg.Hub.GetObject(ctx, p.cfg.BucketID, ObjectsPrefix+entry.UUID, cap)
+	if err != nil {
+		return fmt.Errorf("GET object: %w", err)
+	}
+	if got.Status == http.StatusNotFound {
+		// Object missing on bucket; the manifest referred to it but it's
+		// gone. Treat as a no-op this tick — next tick may see it.
+		p.logger.Warn("manifest references missing object", "uuid", entry.UUID)
+		return nil
+	}
+	if got.Status < 200 || got.Status >= 300 {
+		return fmt.Errorf("GET object HTTP %d", got.Status)
+	}
+
+	// Decrypt the data key (sealed under master key, AAD = uuid).
+	dataKeyIV, err := decodeB64(entry.DataKeyIV)
+	if err != nil {
+		return fmt.Errorf("decode data_key_iv: %w", err)
+	}
+	dataKeyCT, err := decodeB64(entry.DataKeyCT)
+	if err != nil {
+		return fmt.Errorf("decode data_key_ct: %w", err)
+	}
+	dataKey, err := payload.UnwrapDataKey(masterKey, dataKeyIV, dataKeyCT, entry.UUID)
+	if err != nil {
+		return fmt.Errorf("unwrap data key: %w", err)
+	}
+	defer payload.Zero(dataKey)
+
+	// Decrypt the file payload.
+	plain, err := payload.OpenFilePayload(dataKey, got.Body, entry.UUID)
+	if err != nil {
+		return fmt.Errorf("open file payload: %w", err)
+	}
+
+	// Atomic write: temp file in same dir, rename.
+	tmp := localAbs + ".tmp." + newULID()
+	if err := os.MkdirAll(filepath.Dir(tmp), 0o755); err != nil {
+		return fmt.Errorf("mkdir tmp parent: %w", err)
+	}
+	if err := os.WriteFile(tmp, plain, 0o644); err != nil {
+		return fmt.Errorf("write tmp: %w", err)
+	}
+	if err := os.Rename(tmp, localAbs); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s → %s: %w", tmp, localAbs, err)
+	}
+	info, err := os.Stat(localAbs)
+	if err != nil {
+		return fmt.Errorf("post-write stat: %w", err)
+	}
+
+	sum := sha256.Sum256(plain)
+	cached := state.ManifestEntry{
+		RemotePath:   stripLeadingSlash(entry.Path),
+		UUID:         entry.UUID,
+		ContentIV:    entry.ContentIV,
+		ETag:         entry.UUID + ":" + entry.ContentIV, // compose stable etag-equivalent
+		SHA256:       hex.EncodeToString(sum[:]),
+		SizeBytes:    int64(len(plain)),
+		LastModified: time.UnixMilli(entry.TSUnixMs),
+		LocalMtimeNS: info.ModTime().UnixNano(),
+		CachedAt:     p.now().UTC(),
+	}
+	if err := p.cfg.State.UpsertManifestEntry(ctx, cached); err != nil {
+		p.logger.Warn("manifest upsert failed (download succeeded)", "err", err)
+	}
+	p.downloaded.Add(1)
+	p.logger.Info("downloaded",
+		"path", entry.Path, "uuid", entry.UUID, "size", info.Size())
+	return nil
+}
+
+// localChangedSinceSync — same logic as pre-M3.
+func (p *Puller) localChangedSinceSync(localAbs string, cached *state.ManifestEntry) (bool, error) {
+	info, err := os.Stat(localAbs)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.IsDir() {
+		return false, nil
+	}
+	return info.ModTime().UnixNano() > cached.LocalMtimeNS+p.slackNs, nil
+}
+
+func (p *Puller) conflictingRename(ctx context.Context, localAbs, remotePath string) error {
+	ts := p.now().UTC().Format("2006-01-02T15-04-05")
+	conflicted := localAbs + ".conflict-" + ts + ".local"
+	if err := os.Rename(localAbs, conflicted); err != nil {
+		return err
+	}
+	if err := p.cfg.State.LogConflict(ctx, state.ConflictEntry{
+		ConflictID:           "c_" + newULID(),
+		RemotePath:           remotePath,
+		LocalPath:            localAbs,
+		ConflictingLocalPath: conflicted,
+		Resolution:           "conflicting-rename",
+	}); err != nil {
+		p.logger.Warn("LogConflict failed (rename succeeded)", "err", err)
+	}
+	p.conflicts.Add(1)
+	p.logger.Info("conflicting-rename", "local", localAbs, "moved_to", conflicted, "remote", remotePath)
+	return nil
+}
+
+// allCachedKeys returns every remote_path in manifest_cache.
 func (p *Puller) allCachedKeys(ctx context.Context) ([]string, error) {
-	rows, err := p.cfg.State.DB().QueryContext(ctx,
-		`SELECT remote_path FROM manifest_cache`)
+	rows, err := p.cfg.State.DB().QueryContext(ctx, `SELECT remote_path FROM manifest_cache`)
 	if err != nil {
 		return nil, err
 	}
@@ -253,170 +429,30 @@ func (p *Puller) allCachedKeys(ctx context.Context) ([]string, error) {
 	return out, rows.Err()
 }
 
-// reconcileOne processes one remote entry: deciding "no-op," "download,"
-// or "conflict + download."
-func (p *Puller) reconcileOne(ctx context.Context, e listEntry) error {
-	cached, err := p.cfg.State.LookupManifestEntry(ctx, e.Key)
-	if err != nil {
-		return fmt.Errorf("lookup cache: %w", err)
-	}
-	// Cache hit + ETag match ⇒ nothing to do. This is the steady-state
-	// 99%+ path; the puller spends most of its time in this branch.
-	if cached != nil && cached.ETag == e.ETag {
-		return nil
-	}
-
-	// Need to download. First check for a conflict: is the local file
-	// modified since the last sync? If so, the user changed it locally
-	// while the remote also changed → conflicting-rename before download.
-	localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(e.Key))
-	if err := os.MkdirAll(filepath.Dir(localAbs), 0o700); err != nil {
-		return fmt.Errorf("mkdir parent: %w", err)
-	}
-	if cached != nil {
-		if conflicted, err := p.localChangedSinceSync(localAbs, cached); err != nil {
-			return fmt.Errorf("conflict check: %w", err)
-		} else if conflicted {
-			if err := p.conflictingRename(ctx, localAbs, e.Key); err != nil {
-				return fmt.Errorf("conflicting-rename: %w", err)
-			}
-		}
-	}
-
-	return p.downloadTo(ctx, e, localAbs)
-}
-
-// localChangedSinceSync returns true if the local file's mtime is newer
-// than the cached LocalMtimeNS by more than slackNs.
-func (p *Puller) localChangedSinceSync(localAbs string, cached *state.ManifestEntry) (bool, error) {
-	info, err := os.Stat(localAbs)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// Local already gone — no conflict, just download.
-			return false, nil
-		}
-		return false, err
-	}
-	if info.IsDir() {
-		// Defensive: don't conflict-rename a directory.
-		return false, nil
-	}
-	return info.ModTime().UnixNano() > cached.LocalMtimeNS+p.slackNs, nil
-}
-
-// conflictingRename moves localAbs aside to <localAbs>.conflict-<rfc3339>.local
-// and logs the move to conflict_log.
-func (p *Puller) conflictingRename(ctx context.Context, localAbs, remotePath string) error {
-	ts := p.now().UTC().Format("2006-01-02T15-04-05")
-	conflicted := localAbs + ".conflict-" + ts + ".local"
-	if err := os.Rename(localAbs, conflicted); err != nil {
-		return err
-	}
-	conflictID := "c_" + newULID()
-	if err := p.cfg.State.LogConflict(ctx, state.ConflictEntry{
-		ConflictID:           conflictID,
-		RemotePath:           remotePath,
-		LocalPath:            localAbs,
-		ConflictingLocalPath: conflicted,
-		Resolution:           "conflicting-rename",
-	}); err != nil {
-		// Best-effort: the rename succeeded; don't fail the whole op.
-		p.logger.Warn("LogConflict failed (rename succeeded)",
-			"local", conflicted, "err", err)
-	}
-	p.conflicts.Add(1)
-	p.logger.Info("conflicting-rename",
-		"local", localAbs, "moved_to", conflicted, "remote", remotePath)
-	return nil
-}
-
-// downloadTo streams the remote object to localAbs via temp+rename, updates
-// manifest_cache on success.
-func (p *Puller) downloadTo(ctx context.Context, e listEntry, localAbs string) error {
-	resp, err := p.cfg.Hub.GetObject(ctx, p.cfg.BucketID, e.Key, *p.cfg.CapabilityRef)
-	if err != nil {
-		return fmt.Errorf("GET: %w", err)
-	}
-	if resp.Status == http.StatusNotFound {
-		// Object disappeared between LIST and GET — treat as a tombstone
-		// the next tick will pick up. No action this round.
-		return nil
-	}
-	if resp.Status < 200 || resp.Status >= 300 {
-		return fmt.Errorf("GET HTTP %d", resp.Status)
-	}
-
-	// Atomic write: temp file in same dir, fsync, rename.
-	tmp := localAbs + ".tmp." + newULID()
-	if err := os.MkdirAll(filepath.Dir(tmp), 0o700); err != nil {
-		return fmt.Errorf("mkdir tmp parent: %w", err)
-	}
-	if err := os.WriteFile(tmp, resp.Body, 0o644); err != nil {
-		return fmt.Errorf("write tmp: %w", err)
-	}
-	// fsync the tmp file to make the rename durable.
-	if f, err := os.OpenFile(tmp, os.O_RDONLY, 0); err == nil {
-		_ = f.Sync()
-		_ = f.Close()
-	}
-	if err := os.Rename(tmp, localAbs); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename %s → %s: %w", tmp, localAbs, err)
-	}
-	info, err := os.Stat(localAbs)
-	if err != nil {
-		return fmt.Errorf("post-write stat: %w", err)
-	}
-
-	// Update manifest_cache. SHA256 we computed from the downloaded bytes
-	// for cheap; the next push won't need to recompute.
-	sum := sha256.Sum256(resp.Body)
-	if err := p.cfg.State.UpsertManifestEntry(ctx, state.ManifestEntry{
-		RemotePath:   e.Key,
-		ETag:         e.ETag,
-		SHA256:       hex.EncodeToString(sum[:]),
-		SizeBytes:    int64(len(resp.Body)),
-		LastModified: parseLastModified(e.LastModified),
-		LocalMtimeNS: info.ModTime().UnixNano(),
-		CachedAt:     p.now().UTC(),
-	}); err != nil {
-		// Worst case: we downloaded the file but didn't record the row.
-		// Next tick re-downloads (idempotent). Don't fail.
-		p.logger.Warn("manifest upsert failed (download succeeded)", "err", err)
-	}
-	p.downloaded.Add(1)
-	p.logger.Info("downloaded", "rel", e.Key, "size", info.Size(), "etag", e.ETag)
-	return nil
-}
-
 // handleRemoteDelete is called for every manifest_cache row whose key is
-// missing from the latest LIST result. Removes the local file unless it
-// was modified since last sync (in which case we keep the local copy and
-// log a conflict).
+// missing from the latest manifest tree. Same semantics as pre-M3.
 func (p *Puller) handleRemoteDelete(ctx context.Context, key string) error {
 	cached, err := p.cfg.State.LookupManifestEntry(ctx, key)
 	if err != nil {
 		return fmt.Errorf("lookup: %w", err)
 	}
 	if cached == nil {
-		return nil // race: row deleted between query + this lookup
+		return nil
 	}
-	localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(key))
+	localAbs := filepath.Join(p.cfg.LocalPath, filepath.FromSlash(stripLeadingSlash(key)))
 	info, statErr := os.Stat(localAbs)
 	switch {
 	case errors.Is(statErr, os.ErrNotExist):
-		// Local already gone — just clear the cache row.
+		// Local already gone.
 	case statErr != nil:
 		return fmt.Errorf("stat: %w", statErr)
 	default:
-		// Local file exists. Conflict if user modified it since last sync.
 		if info.ModTime().UnixNano() > cached.LocalMtimeNS+p.slackNs {
-			conflictID := "c_" + newULID()
 			if err := p.cfg.State.LogConflict(ctx, state.ConflictEntry{
-				ConflictID:           conflictID,
+				ConflictID:           "c_" + newULID(),
 				RemotePath:           key,
 				LocalPath:            localAbs,
-				ConflictingLocalPath: localAbs, // local kept in place
+				ConflictingLocalPath: localAbs,
 				Resolution:           "remote-deleted-local-kept",
 			}); err != nil {
 				p.logger.Warn("LogConflict failed", "err", err)
@@ -424,74 +460,38 @@ func (p *Puller) handleRemoteDelete(ctx context.Context, key string) error {
 			p.conflicts.Add(1)
 			p.logger.Info("remote deleted, local modified — keeping local",
 				"key", key, "local", localAbs)
-			// Clear the cache row so the next push reuploads the local file
-			// (the user's intent).
 			if err := p.cfg.State.DeleteManifestEntry(ctx, key); err != nil {
 				return err
 			}
 			return nil
 		}
-		// Local unchanged since last sync ⇒ honour the remote delete.
 		if err := os.Remove(localAbs); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("remove local: %w", err)
 		}
 		p.deletedLocal.Add(1)
 		p.logger.Info("removed local (remote deleted)", "key", key, "local", localAbs)
 	}
-
 	return p.cfg.State.DeleteManifestEntry(ctx, key)
 }
 
-// --- LIST XML parsing -------------------------------------------------------
+// --- helpers --------------------------------------------------------------
 
-type listResult struct {
-	XMLName               xml.Name    `xml:"ListBucketResult"`
-	IsTruncated           bool        `xml:"IsTruncated"`
-	Contents              []listEntry `xml:"Contents"`
-	NextContinuationToken string      `xml:"NextContinuationToken"`
+func stripLeadingSlash(s string) string {
+	if len(s) > 0 && s[0] == '/' {
+		return s[1:]
+	}
+	return s
 }
 
-type listEntry struct {
-	Key          string `xml:"Key"`
-	Size         int64  `xml:"Size"`
-	ETag         string `xml:"ETag"`
-	LastModified string `xml:"LastModified"`
+func decodeB64(s string) ([]byte, error) {
+	// Manifest writes base64-std; tolerate URL-safe on read for forward-compat.
+	b, err := stdB64Decode(s)
+	if err == nil {
+		return b, nil
+	}
+	return urlB64Decode(s)
 }
 
-func parseListXML(b []byte) (*listResult, error) {
-	if len(b) == 0 {
-		return nil, errors.New("empty body")
-	}
-	var r listResult
-	if err := xml.Unmarshal(b, &r); err != nil {
-		return nil, err
-	}
-	// S3 returns ETag wrapped in quotes ("etag-abc"). Strip for comparison.
-	for i := range r.Contents {
-		r.Contents[i].ETag = strings.Trim(r.Contents[i].ETag, `"`)
-	}
-	return &r, nil
-}
-
-// parseLastModified parses S3's ISO-8601 timestamp. Returns zero time on
-// any parse error (callers don't crash on bad LastModified — it's a hint,
-// not a primary key).
-func parseLastModified(s string) time.Time {
-	for _, fmt := range []string{
-		time.RFC3339,
-		time.RFC3339Nano,
-		"2006-01-02T15:04:05.000Z",
-		"2006-01-02T15:04:05Z",
-	} {
-		if t, err := time.Parse(fmt, s); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
-}
-
-// newULID returns a fresh lexicographic id. Used for conflict_id +
-// download temp-file suffixes.
 func newULID() string {
 	id, err := ulid.New(ulid.Now(), rand.Reader)
 	if err != nil {
@@ -499,3 +499,8 @@ func newULID() string {
 	}
 	return id.String()
 }
+
+// Local b64 helpers — avoid importing encoding/base64 twice with different
+// names; keep callers honest.
+func stdB64Decode(s string) ([]byte, error) { return b64.StdEncoding.DecodeString(s) }
+func urlB64Decode(s string) ([]byte, error) { return b64.RawURLEncoding.DecodeString(s) }

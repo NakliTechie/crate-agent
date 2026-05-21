@@ -3,6 +3,7 @@ package syncer
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/NakliTechie/crate-agent/internal/httpc"
+	"github.com/NakliTechie/crate-agent/internal/manifest"
+	"github.com/NakliTechie/crate-agent/internal/payload"
 	"github.com/NakliTechie/crate-agent/internal/state"
 	"github.com/NakliTechie/crate-agent/internal/watcher"
 )
@@ -149,6 +152,11 @@ type rig struct {
 	syncer    *Syncer
 	cancel    context.CancelFunc
 	done      chan struct{}
+
+	// M3 wire-format references shared with the syncer — tests use them
+	// to decrypt the on-hub ciphertext and verify round-trips.
+	masterKey []byte
+	manifest  *manifest.Manifest
 }
 
 func setupSyncer(t *testing.T, cfgMods ...func(*Config)) *rig {
@@ -177,16 +185,28 @@ func setupSyncer(t *testing.T, cfgMods ...func(*Config)) *rig {
 	hub := newFakeHub(t, "bk_test")
 	client := httpc.New(hub.URL())
 
+	// M3 wire format requires master-key + shared manifest references.
+	cap := "test-capability"
+	masterKey := make([]byte, 32)
+	for i := range masterKey {
+		masterKey[i] = byte(i + 7)
+	}
+	sharedManifest := manifest.New()
+	sharedManifestMu := &sync.Mutex{}
+
 	cfg := Config{
-		LocalPath:    localPath,
-		BucketID:     "bk_test",
-		Capability:   "test-capability",
-		Hub:          client,
-		Watcher:      w,
-		State:        store,
-		PollInterval: 50 * time.Millisecond,
-		BackoffBase:  50 * time.Millisecond,
-		BackoffCap:   200 * time.Millisecond,
+		LocalPath:     localPath,
+		BucketID:      "bk_test",
+		CapabilityRef: &cap,
+		MasterKeyRef:  &masterKey,
+		ManifestRef:   sharedManifest,
+		ManifestMu:    sharedManifestMu,
+		Hub:           client,
+		Watcher:       w,
+		State:         store,
+		PollInterval:  50 * time.Millisecond,
+		BackoffBase:   50 * time.Millisecond,
+		BackoffCap:    200 * time.Millisecond,
 	}
 	for _, m := range cfgMods {
 		m(&cfg)
@@ -220,6 +240,8 @@ func setupSyncer(t *testing.T, cfgMods ...func(*Config)) *rig {
 		syncer:    syncer,
 		cancel:    cancel,
 		done:      done,
+		masterKey: masterKey,
+		manifest:  sharedManifest,
 	}
 }
 
@@ -237,36 +259,89 @@ func waitFor(t *testing.T, d time.Duration, p func() bool) bool {
 	return p()
 }
 
+// findObjectsKey walks the fake-hub's storage and returns the first key
+// matching "objects/{uuid}". Useful since the daemon allocates random
+// uuids the test doesn't know in advance.
+func (h *fakeHub) findObjectsKey() (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k := range h.objects {
+		if strings.HasPrefix(k, "objects/") {
+			return k, true
+		}
+	}
+	return "", false
+}
+
 func TestSyncer_UploadOnCreate(t *testing.T) {
 	r := setupSyncer(t)
-	payload := []byte("hello from the daemon\n")
-	if err := os.WriteFile(filepath.Join(r.localPath, "hello.txt"), payload, 0o644); err != nil {
+	plain := []byte("hello from the daemon\n")
+	if err := os.WriteFile(filepath.Join(r.localPath, "hello.txt"), plain, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := waitFor(t, 3*time.Second, func() bool {
-		b, ok := r.hub.get("hello.txt")
-		return ok && string(b) == string(payload)
+
+	// Wait for both the objects/ ciphertext AND the encrypted manifest to
+	// land at the fake hub.
+	landed := waitFor(t, 3*time.Second, func() bool {
+		_, hasObj := r.hub.findObjectsKey()
+		_, hasManifest := r.hub.get(".crate/manifest.jsonl.enc")
+		return hasObj && hasManifest
 	})
-	if !got {
-		t.Fatalf("hello.txt was not uploaded; hub has: %v", r.hub.objects)
+	if !landed {
+		t.Fatalf("PUTs didn't land; hub keys: %v", hubKeys(r.hub))
 	}
 
-	// manifest_cache should have a row.
-	m, err := r.state.LookupManifestEntry(context.Background(), "hello.txt")
+	// Decrypt the manifest with the test master key and confirm there's
+	// exactly one create event for /hello.txt.
+	manBytes, _ := r.hub.get(".crate/manifest.jsonl.enc")
+	m, err := manifest.LoadFromBytes(manBytes, r.masterKey)
+	if err != nil {
+		t.Fatalf("manifest decrypt failed: %v", err)
+	}
+	if m.Size() == 0 {
+		t.Fatal("manifest has no events")
+	}
+	ok, idx, reason := m.Verify(r.masterKey)
+	if !ok {
+		t.Fatalf("manifest verify failed at %d: %s", idx, reason)
+	}
+	tree := m.Materialise()
+	entry, present := tree["/hello.txt"]
+	if !present {
+		t.Fatalf("/hello.txt missing from materialised tree; got %v", treeKeys(tree))
+	}
+	if entry.Size != int64(len(plain)) {
+		t.Errorf("entry.Size = %d, want %d", entry.Size, len(plain))
+	}
+
+	// Now decrypt the objects/{uuid} ciphertext and confirm bytes match.
+	objKey, _ := r.hub.findObjectsKey()
+	objBytes, _ := r.hub.get(objKey)
+
+	dataKeyIV, _ := base64StdDecode(entry.DataKeyIV)
+	dataKeyCT, _ := base64StdDecode(entry.DataKeyCT)
+	dataKey, err := payload.UnwrapDataKey(r.masterKey, dataKeyIV, dataKeyCT, entry.UUID)
+	if err != nil {
+		t.Fatalf("unwrap data key: %v", err)
+	}
+	got, err := payload.OpenFilePayload(dataKey, objBytes, entry.UUID)
+	if err != nil {
+		t.Fatalf("open file payload: %v", err)
+	}
+	if string(got) != string(plain) {
+		t.Errorf("decrypted bytes mismatch:\n got:  %q\n want: %q", got, plain)
+	}
+
+	// manifest_cache should have a row pointing at this uuid.
+	cached, err := r.state.LookupManifestEntry(context.Background(), "hello.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m == nil {
+	if cached == nil {
 		t.Fatal("manifest_cache missing hello.txt")
 	}
-	if m.SizeBytes != int64(len(payload)) {
-		t.Errorf("manifest size = %d, want %d", m.SizeBytes, len(payload))
-	}
-	if m.ETag == "" {
-		t.Errorf("manifest ETag is empty")
-	}
-	if m.SHA256 == "" {
-		t.Errorf("manifest SHA256 is empty")
+	if cached.UUID != entry.UUID {
+		t.Errorf("cache.UUID = %s, want %s", cached.UUID, entry.UUID)
 	}
 }
 
@@ -276,18 +351,24 @@ func TestSyncer_DeleteOnRemove(t *testing.T) {
 	if err := os.WriteFile(path, []byte("transient"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !waitFor(t, 3*time.Second, func() bool { _, ok := r.hub.get("doomed.txt"); return ok }) {
+	// Wait until the initial PUT (both objects/{uuid} and manifest) lands.
+	if !waitFor(t, 3*time.Second, func() bool {
+		_, hasObj := r.hub.findObjectsKey()
+		_, hasMan := r.hub.get(".crate/manifest.jsonl.enc")
+		return hasObj && hasMan
+	}) {
 		t.Fatal("initial PUT didn't land")
 	}
+	initialKey, _ := r.hub.findObjectsKey()
+
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	// Wait until BOTH the Hub copy is gone AND the manifest_cache row is
-	// removed. The two updates happen in sequence inside the worker
-	// goroutine (Hub DELETE → DeleteManifestEntry); separate predicates
-	// would race.
+	// Wait until BOTH:
+	//   - The hub's objects/{uuid} for doomed.txt is gone (DELETE landed)
+	//   - The manifest_cache row is cleared (DeleteManifestEntry ran)
 	deleted := waitFor(t, 3*time.Second, func() bool {
-		if _, ok := r.hub.get("doomed.txt"); ok {
+		if _, ok := r.hub.get(initialKey); ok {
 			return false
 		}
 		m, err := r.state.LookupManifestEntry(context.Background(), "doomed.txt")
@@ -303,20 +384,20 @@ func TestSyncer_DeleteOnRemove(t *testing.T) {
 
 func TestSyncer_RetriesOnFailure(t *testing.T) {
 	r := setupSyncer(t)
-	// First 2 PUT requests fail with 500; 3rd succeeds.
+	// First 2 PUT requests fail. PUTs happen against either objects/{uuid}
+	// or the manifest path; either way, the syncer treats the upload as
+	// failed and retries. Inject failures.
 	r.hub.setFailNext(2)
 
-	payload := []byte("retry me")
-	if err := os.WriteFile(filepath.Join(r.localPath, "retry.txt"), payload, 0o644); err != nil {
+	plain := []byte("retry me")
+	if err := os.WriteFile(filepath.Join(r.localPath, "retry.txt"), plain, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Wait for the file to land at the Hub AND the upload_queue row to be
-	// marked completed. The two updates happen in sequence inside the
-	// worker goroutine (Hub PUT → MarkUploadAttempt success), so checking
-	// the queue depth separately would race.
+	// Eventually the upload should land + the queue should drain.
 	ok := waitFor(t, 5*time.Second, func() bool {
-		b, ok := r.hub.get("retry.txt")
-		if !ok || string(b) != string(payload) {
+		_, hasObj := r.hub.findObjectsKey()
+		_, hasMan := r.hub.get(".crate/manifest.jsonl.enc")
+		if !hasObj || !hasMan {
 			return false
 		}
 		n, err := r.state.PendingUploadCount(context.Background())
@@ -326,9 +407,31 @@ func TestSyncer_RetriesOnFailure(t *testing.T) {
 		t.Fatalf("retry.txt never landed cleanly; puts=%d", r.hub.puts.Load())
 	}
 	if r.hub.puts.Load() < 3 {
-		t.Errorf("expected ≥3 PUTs (2 failures + 1 success); got %d", r.hub.puts.Load())
+		t.Errorf("expected ≥3 PUTs (≥2 failed + at least 1 success); got %d", r.hub.puts.Load())
 	}
 }
+
+// --- test helpers ---------------------------------------------------------
+
+func hubKeys(h *fakeHub) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	keys := make([]string, 0, len(h.objects))
+	for k := range h.objects {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func treeKeys(t map[string]*manifest.Entry) []string {
+	keys := make([]string, 0, len(t))
+	for k := range t {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func base64StdDecode(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }
 
 func TestSyncer_BackoffSchedule(t *testing.T) {
 	// Test the backoff calculation directly so we don't have to wait on
@@ -361,7 +464,10 @@ func TestNewRejectsMissingFields(t *testing.T) {
 	}{
 		{"no LocalPath", func(c *Config) { c.LocalPath = "" }},
 		{"no BucketID", func(c *Config) { c.BucketID = "" }},
-		{"no Capability", func(c *Config) { c.Capability = "" }},
+		{"no CapabilityRef", func(c *Config) { c.CapabilityRef = nil }},
+		{"no MasterKeyRef", func(c *Config) { c.MasterKeyRef = nil }},
+		{"no ManifestRef", func(c *Config) { c.ManifestRef = nil }},
+		{"no ManifestMu", func(c *Config) { c.ManifestMu = nil }},
 		{"no Hub", func(c *Config) { c.Hub = nil }},
 		{"no Watcher", func(c *Config) { c.Watcher = nil }},
 		{"no State", func(c *Config) { c.State = nil }},
@@ -374,12 +480,17 @@ func TestNewRejectsMissingFields(t *testing.T) {
 			_ = os.MkdirAll(filepath.Join(tmp, "crate"), 0o755)
 			w, _ := watcher.New(watcher.Options{Root: filepath.Join(tmp, "crate")})
 			defer w.Close()
+			cap := "cap"
+			mk := make([]byte, 32)
 			cfg := Config{
-				LocalPath:  filepath.Join(tmp, "crate"),
-				BucketID:   "bk_x",
-				Capability: "cap",
-				Hub:        httpc.New("http://127.0.0.1:1"),
-				Watcher:    w,
+				LocalPath:     filepath.Join(tmp, "crate"),
+				BucketID:      "bk_x",
+				CapabilityRef: &cap,
+				MasterKeyRef:  &mk,
+				ManifestRef:   manifest.New(),
+				ManifestMu:    &sync.Mutex{},
+				Hub:           httpc.New("http://127.0.0.1:1"),
+				Watcher:       w,
 				State:      store,
 			}
 			c.mod(&cfg)
