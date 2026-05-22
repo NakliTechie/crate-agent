@@ -29,6 +29,13 @@ import (
 type Client struct {
 	endpoint string
 	http     *http.Client
+	// deviceID is the value the Hub bound to this daemon's capability via
+	// the `device-id == ...` caveat at pair time. It is sent as the
+	// X-Fabric-Device-Id header on every authenticated request so the
+	// Hub's strict-binding mode can verify the caveat. Empty means the
+	// daemon hasn't called SetDeviceID — the header is omitted (Hub
+	// rejects when strict mode is on; tolerated when off).
+	deviceID string
 }
 
 // New builds a client whose requests are issued against `endpoint`
@@ -40,6 +47,24 @@ func New(endpoint string) *Client {
 		http: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+	}
+}
+
+// SetDeviceID attaches the daemon's device-id (the value bound by the
+// `device-id == ...` caveat at pair time). After this call, every
+// authenticated request also sends X-Fabric-Device-Id, satisfying the
+// Hub's strict caveat-binding mode (private-mesh PR #5).
+func (c *Client) SetDeviceID(id string) {
+	c.deviceID = id
+}
+
+// setAuthHeaders sets X-Fabric-Grant and (when known) X-Fabric-Device-Id.
+// Used by every authenticated request path so the device-id binding is
+// applied consistently.
+func (c *Client) setAuthHeaders(req *http.Request, capability string) {
+	req.Header.Set("X-Fabric-Grant", capability)
+	if c.deviceID != "" {
+		req.Header.Set("X-Fabric-Device-Id", c.deviceID)
 	}
 }
 
@@ -115,7 +140,7 @@ func (c *Client) postJSON(ctx context.Context, path string, body interface{}, ca
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if capability != "" {
-		req.Header.Set("X-Fabric-Grant", capability)
+		c.setAuthHeaders(req, capability)
 	}
 	return c.do(req, path)
 }
@@ -186,7 +211,7 @@ func (c *Client) PutObjectIfMatch(
 		contentType = "application/octet-stream"
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("X-Fabric-Grant", capability)
+	c.setAuthHeaders(req, capability)
 	if ifMatch != "" {
 		// Normalise to a quoted value — S3-API providers expect ETag
 		// values quoted. Defensive: if the caller already quoted, don't
@@ -212,7 +237,7 @@ func (c *Client) DeleteObject(
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build DELETE %s: %w", path, err)
 	}
-	req.Header.Set("X-Fabric-Grant", capability)
+	c.setAuthHeaders(req, capability)
 	return c.do(req, path)
 }
 
@@ -229,7 +254,7 @@ func (c *Client) HeadObject(
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build HEAD %s: %w", path, err)
 	}
-	req.Header.Set("X-Fabric-Grant", capability)
+	c.setAuthHeaders(req, capability)
 	return c.do(req, path)
 }
 
@@ -249,7 +274,7 @@ func (c *Client) GetObject(
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build GET %s: %w", path, err)
 	}
-	req.Header.Set("X-Fabric-Grant", capability)
+	c.setAuthHeaders(req, capability)
 	return c.doWithBody(req, path)
 }
 
@@ -277,7 +302,7 @@ func (c *Client) ListObjects(
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build LIST %s: %w", path, err)
 	}
-	req.Header.Set("X-Fabric-Grant", capability)
+	c.setAuthHeaders(req, capability)
 	return c.doWithBody(req, path)
 }
 

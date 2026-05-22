@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	sdkcrypto "github.com/NakliTechie/private-mesh/fabric-sdk-go/crypto"
+	"github.com/NakliTechie/private-mesh/fabric-sdk-go/grant"
 
 	"github.com/NakliTechie/crate-agent/internal/config"
 	"github.com/NakliTechie/crate-agent/internal/cratejson"
@@ -180,6 +182,15 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	// --- HTTP client -----------------------------------------------------
 	client := httpc.New(cfg.Crate.TransportEndpoint)
+	// The daemon's capability carries `device-id == <daemon_pubkey>` from
+	// the pair-mint flow. Extract it and tell the client to send the
+	// matching X-Fabric-Device-Id header on every authenticated request,
+	// so the Hub's strict caveat-binding mode (private-mesh PR #5) is
+	// satisfied. Failure here is non-fatal: the daemon proceeds without
+	// the header, which the Hub accepts in lax mode (the default today).
+	if did := deviceIDFromCapability(capabilityBytes); did != "" {
+		client.SetDeviceID(did)
+	}
 
 	// --- Salt reconciliation (M3 piece 7) --------------------------------
 	// Forward-compatible: the browser may not have written .crate/crate.json
@@ -314,6 +325,24 @@ func runStart(cmd *cobra.Command, _ []string) error {
 
 	fmt.Println("✓ stopped cleanly")
 	return nil
+}
+
+// deviceIDFromCapability parses the daemon's capability macaroon and
+// returns the value of the `device-id == <X>` caveat, or "" if the
+// macaroon does not carry that caveat (unexpected for a pair-minted
+// daemon capability, but should not crash the daemon).
+func deviceIDFromCapability(macBytes []byte) string {
+	g, err := grant.Parse(macBytes)
+	if err != nil {
+		return ""
+	}
+	const prefix = "device-id == "
+	for _, c := range g.Caveats {
+		if strings.HasPrefix(c, prefix) {
+			return strings.TrimSpace(c[len(prefix):])
+		}
+	}
+	return ""
 }
 
 // obtainPassphrase reads the passphrase from stdin / env / interactive
