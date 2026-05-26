@@ -159,3 +159,64 @@ func TestZero(t *testing.T) {
 		}
 	}
 }
+
+// --- v1.1 content-key wrap tests -----------------------------------------
+
+func TestWrapUnwrapKey_RoundTrip(t *testing.T) {
+	kek, _ := RandomBytes(KeySize)
+	contentKey, _ := RandomBytes(KeySize)
+	iv, ct, err := WrapKey(kek, contentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(iv) != IVSize {
+		t.Errorf("iv length = %d, want %d", len(iv), IVSize)
+	}
+	if len(ct) != KeySize+TagSize {
+		t.Errorf("ct length = %d, want %d (key + GCM tag)", len(ct), KeySize+TagSize)
+	}
+	got, err := UnwrapKey(kek, iv, ct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, contentKey) {
+		t.Errorf("round-trip mismatch")
+	}
+}
+
+func TestUnwrapKey_RejectsWrongKEK(t *testing.T) {
+	kek1, _ := RandomBytes(KeySize)
+	kek2, _ := RandomBytes(KeySize)
+	contentKey, _ := RandomBytes(KeySize)
+	iv, ct, err := WrapKey(kek1, contentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnwrapKey(kek2, iv, ct); err == nil {
+		t.Errorf("UnwrapKey with wrong KEK should fail (passphrase-mismatch path)")
+	}
+}
+
+func TestUnwrapKey_RejectsTamperedCT(t *testing.T) {
+	kek, _ := RandomBytes(KeySize)
+	contentKey, _ := RandomBytes(KeySize)
+	iv, ct, err := WrapKey(kek, contentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct[0] ^= 0x01 // flip a bit in the wrapped key
+	if _, err := UnwrapKey(kek, iv, ct); err == nil {
+		t.Errorf("UnwrapKey on tampered ct should fail (GCM auth-tag mismatch)")
+	}
+}
+
+func TestWrapKey_RejectsBadLengths(t *testing.T) {
+	good := make([]byte, KeySize)
+	short := make([]byte, KeySize-1)
+	if _, _, err := WrapKey(short, good); err == nil {
+		t.Errorf("WrapKey should reject KEK shorter than %d bytes", KeySize)
+	}
+	if _, _, err := WrapKey(good, short); err == nil {
+		t.Errorf("WrapKey should reject content key shorter than %d bytes", KeySize)
+	}
+}

@@ -128,6 +128,57 @@ func UnwrapDataKey(masterKey, iv, ciphertext []byte, fileUUID string) ([]byte, e
 	return Open(masterKey, iv, ciphertext, []byte(fileUUID))
 }
 
+// --- v1.1 content-key wrap (KEK → master key) ------------------------------
+//
+// In v1.1, the master/content key is RANDOM (not derived) and stored
+// AES-256-GCM-wrapped under one or more KEKs in .crate/crate.json. The
+// wrap is self-contained — no AAD — so any KEK can unwrap independently.
+// Matches the browser's lib/crypto.js::wrapKey/unwrapKey byte-for-byte.
+//
+// Wrapped ciphertext layout: 32-byte wrapped key + 16-byte GCM auth tag
+// (48 bytes total). IV is 12 bytes, stored alongside in the wrap slot.
+
+// WrapKey seals a 32-byte content key under a KEK with a fresh IV. No AAD.
+// Returns (iv, ciphertext). ciphertext is exactly 48 bytes.
+func WrapKey(kek, contentKey []byte) ([]byte, []byte, error) {
+	if len(kek) != KeySize {
+		return nil, nil, fmt.Errorf("payload.WrapKey: kek length %d, want %d", len(kek), KeySize)
+	}
+	if len(contentKey) != KeySize {
+		return nil, nil, fmt.Errorf("payload.WrapKey: contentKey length %d, want %d", len(contentKey), KeySize)
+	}
+	iv, err := RandomIV()
+	if err != nil {
+		return nil, nil, err
+	}
+	ct, err := Seal(kek, iv, contentKey, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return iv, ct, nil
+}
+
+// UnwrapKey opens a v1.1 wrap slot. Returns the 32-byte content key on
+// success. Errors on AES-GCM auth-tag mismatch (wrong KEK or tampered
+// ciphertext) — callers treating that as "wrong passphrase" should map
+// the error appropriately.
+func UnwrapKey(kek, iv, ciphertext []byte) ([]byte, error) {
+	if len(kek) != KeySize {
+		return nil, fmt.Errorf("payload.UnwrapKey: kek length %d, want %d", len(kek), KeySize)
+	}
+	if len(ciphertext) != KeySize+TagSize {
+		return nil, fmt.Errorf("payload.UnwrapKey: ciphertext length %d, want %d (key + GCM tag)", len(ciphertext), KeySize+TagSize)
+	}
+	out, err := Open(kek, iv, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) != KeySize {
+		return nil, fmt.Errorf("payload.UnwrapKey: unwrapped length %d, want %d", len(out), KeySize)
+	}
+	return out, nil
+}
+
 // SealFilePayload encrypts a file's plaintext bytes under dataKey + a
 // fresh IV. fileUUID bound as AAD. Returns the on-bucket object body:
 // 12-byte IV || ciphertext || 16-byte tag.

@@ -30,6 +30,30 @@ const SaltLen = 16
 // DeriveMasterKey runs PBKDF2-SHA256(passphrase, salt, 600k, 32) and
 // returns the derived key. Both inputs are zeroed by the caller after
 // the returned key is used.
+//
+// Used by the v1.0 schema path where master key = PBKDF2(passphrase, salt)
+// directly. v1.1 separates KEK derivation from the content/master key —
+// see DeriveKEK / DerivePassphraseKEK below.
 func DeriveMasterKey(passphrase string, salt []byte) []byte {
 	return pbkdf2.Key([]byte(passphrase), salt, Iterations, KeyLen, sha256.New)
+}
+
+// DeriveKEK runs PBKDF2-SHA256 over arbitrary input bytes and returns 32
+// raw bytes. `secret` is the caller's choice of UTF-8(passphrase) or raw
+// entropy (e.g. BIP-39 mnemonic-to-entropy output).
+//
+// `iter` is taken explicitly (not a constant) so the caller can honour
+// the iteration count stored in .crate/crate.json's wrap slot — future
+// wraps may use a higher count, and v1.1 readers should not silently
+// downgrade.
+func DeriveKEK(secret, salt []byte, iter int) []byte {
+	return pbkdf2.Key(secret, salt, iter, KeyLen, sha256.New)
+}
+
+// DerivePassphraseKEK is a convenience wrapper around DeriveKEK for the
+// passphrase-KEK case — UTF-8-encodes the passphrase + delegates. Bytes-
+// for-bytes equivalent to DeriveMasterKey(passphrase, salt) when iter ==
+// Iterations.
+func DerivePassphraseKEK(passphrase string, salt []byte, iter int) []byte {
+	return DeriveKEK([]byte(passphrase), salt, iter)
 }

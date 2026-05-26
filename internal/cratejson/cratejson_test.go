@@ -17,6 +17,7 @@ import (
 	"github.com/NakliTechie/crate-agent/internal/config"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
 	"github.com/NakliTechie/crate-agent/internal/kdf"
+	"github.com/NakliTechie/crate-agent/internal/payload"
 )
 
 // fakeHub serves a single /v1/crate/object/{bucket}/.crate/crate.json route.
@@ -368,5 +369,284 @@ func TestCanonicalSaltEqual(t *testing.T) {
 	}
 	if CanonicalSaltEqual("not-b64", a) {
 		t.Errorf("malformed b64 compared equal")
+	}
+}
+
+// --- v1.1 schema tests ----------------------------------------------------
+
+// makeV11Doc constructs a v1.1 doc body with a single passphrase_wrap.
+// Returns the JSON bytes, the canonical salt, and the content key (caller
+// uses the content key to verify Reconcile unwrapped correctly).
+func makeV11Doc(t *testing.T, pass string) (body, saltBytes, contentKey []byte) {
+	t.Helper()
+	saltBytes = make([]byte, 16)
+	for i := range saltBytes {
+		saltBytes[i] = byte(0x30 + i)
+	}
+	iter := 600_000
+	kek := kdf.DerivePassphraseKEK(pass, saltBytes, iter)
+	contentKey, _ = payload.RandomBytes(payload.KeySize)
+	iv, ct, err := payload.WrapKey(kek, contentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := Doc{
+		V:       1,
+		Version: "1.1",
+		PassphraseWrap: &Wrap{
+			KDF:  "PBKDF2-SHA256",
+			Iter: iter,
+			Salt: base64.StdEncoding.EncodeToString(saltBytes),
+			IV:   base64.StdEncoding.EncodeToString(iv),
+			CT:   base64.StdEncoding.EncodeToString(ct),
+		},
+	}
+	body, _ = json.Marshal(doc)
+	return body, saltBytes, contentKey
+}
+
+func TestFetch_V11_HappyPath(t *testing.T) {
+	body, _, _ := makeV11Doc(t, "test-passphrase")
+	h := newFakeHub(t, "bk_test")
+	h.body = body
+	client := httpc.New(h.ts.URL)
+	got, err := Fetch(context.Background(), client, "bk_test", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.IsV11() {
+		t.Errorf("IsV11() = false; want true")
+	}
+	if got.PassphraseWrap == nil {
+		t.Fatal("PassphraseWrap is nil")
+	}
+	if _, err := got.PassphraseWrap.SaltBytes(); err != nil {
+		t.Errorf("SaltBytes: %v", err)
+	}
+	if _, err := got.PassphraseWrap.IVBytes(); err != nil {
+		t.Errorf("IVBytes: %v", err)
+	}
+	if _, err := got.PassphraseWrap.CTBytes(); err != nil {
+		t.Errorf("CTBytes: %v", err)
+	}
+	if _, err := got.SaltBytes(); err == nil {
+		t.Errorf("Doc.SaltBytes() on a v1.1 doc should error (use PassphraseWrap.SaltBytes())")
+	}
+}
+
+func TestFetch_V11_WithRecoveryWrap(t *testing.T) {
+	body, _, _ := makeV11Doc(t, "tp")
+	var raw map[string]any
+	_ = json.Unmarshal(body, &raw)
+	raw["recovery_wrap"] = map[string]any{
+		"kdf":  "PBKDF2-SHA256",
+		"iter": 600000,
+		"salt": base64.StdEncoding.EncodeToString(make([]byte, 16)),
+		"iv":   base64.StdEncoding.EncodeToString(make([]byte, 12)),
+		"ct":   base64.StdEncoding.EncodeToString(make([]byte, 48)),
+	}
+	body2, _ := json.Marshal(raw)
+	h := newFakeHub(t, "bk_test")
+	h.body = body2
+	client := httpc.New(h.ts.URL)
+	got, err := Fetch(context.Background(), client, "bk_test", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RecoveryWrap == nil {
+		t.Fatal("RecoveryWrap not populated")
+	}
+	if _, err := got.RecoveryWrap.SaltBytes(); err != nil {
+		t.Errorf("RecoveryWrap.SaltBytes: %v", err)
+	}
+}
+
+func TestFetch_V11_VersionMismatch_Rejected(t *testing.T) {
+	body, _, _ := makeV11Doc(t, "tp")
+	var raw map[string]any
+	_ = json.Unmarshal(body, &raw)
+	raw["version"] = "1.0"
+	body2, _ := json.Marshal(raw)
+	h := newFakeHub(t, "bk_test")
+	h.body = body2
+	client := httpc.New(h.ts.URL)
+	_, err := Fetch(context.Background(), client, "bk_test", "x")
+	if err == nil {
+		t.Errorf("Fetch should reject v1.1 doc with version=1.0")
+	} else if !strings.Contains(err.Error(), "1.1") {
+		t.Errorf("error should mention expected version 1.1; got: %v", err)
+	}
+}
+
+func TestFetch_V11_LowIter_Rejected(t *testing.T) {
+	body, _, _ := makeV11Doc(t, "tp")
+	var raw map[string]any
+	_ = json.Unmarshal(body, &raw)
+	raw["passphrase_wrap"].(map[string]any)["iter"] = float64(1000)
+	body2, _ := json.Marshal(raw)
+	h := newFakeHub(t, "bk_test")
+	h.body = body2
+	client := httpc.New(h.ts.URL)
+	_, err := Fetch(context.Background(), client, "bk_test", "x")
+	if err == nil {
+		t.Errorf("Fetch should reject low iter count")
+	}
+}
+
+func TestFetch_NeitherSaltNorWrap_Rejected(t *testing.T) {
+	body, _ := json.Marshal(Doc{V: 1})
+	h := newFakeHub(t, "bk_test")
+	h.body = body
+	client := httpc.New(h.ts.URL)
+	_, err := Fetch(context.Background(), client, "bk_test", "x")
+	if err == nil {
+		t.Errorf("Fetch should reject doc with neither salt nor passphrase_wrap")
+	}
+}
+
+func TestWrap_Validate_RejectsBadFields(t *testing.T) {
+	good := &Wrap{
+		KDF: "PBKDF2-SHA256", Iter: 600000,
+		Salt: base64.StdEncoding.EncodeToString(make([]byte, 16)),
+		IV:   base64.StdEncoding.EncodeToString(make([]byte, 12)),
+		CT:   base64.StdEncoding.EncodeToString(make([]byte, 48)),
+	}
+	if err := good.Validate(); err != nil {
+		t.Fatalf("Good wrap should validate: %v", err)
+	}
+	cases := []struct {
+		name   string
+		mutate func(w *Wrap)
+	}{
+		{"wrong kdf", func(w *Wrap) { w.KDF = "scrypt" }},
+		{"iter too low", func(w *Wrap) { w.Iter = 1000 }},
+		{"salt wrong length", func(w *Wrap) { w.Salt = base64.StdEncoding.EncodeToString(make([]byte, 8)) }},
+		{"iv wrong length", func(w *Wrap) { w.IV = base64.StdEncoding.EncodeToString(make([]byte, 8)) }},
+		{"ct wrong length", func(w *Wrap) { w.CT = base64.StdEncoding.EncodeToString(make([]byte, 32)) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := *good
+			tc.mutate(&bad)
+			if err := bad.Validate(); err == nil {
+				t.Errorf("expected validation error for: %s", tc.name)
+			}
+		})
+	}
+}
+
+// --- v1.1 reconcile tests -------------------------------------------------
+
+func TestReconcile_V11_SameSalt_UnwrapsContentKey(t *testing.T) {
+	pass := "test-passphrase"
+	dir := t.TempDir()
+	body, saltBytes, contentKey := makeV11Doc(t, pass)
+
+	// Local capability is sealed under the passphrase-KEK (= same salt as
+	// canonical, simulating an already-reconciled v1.1 daemon restart).
+	capabilityKEK := kdf.DerivePassphraseKEK(pass, saltBytes, 600_000)
+	cap := []byte("CAPABILITY-PLAINTEXT")
+	cfgPath, cfg := seedCfg(t, dir, capabilityKEK, saltBytes, cap)
+
+	h := newFakeHub(t, "bk_test")
+	h.body = body
+	client := httpc.New(h.ts.URL)
+
+	res := Reconcile(context.Background(), ReconcileInput{
+		CfgPath:          cfgPath,
+		Cfg:              cfg,
+		Passphrase:       pass,
+		CurrentMasterKey: capabilityKEK,
+		CapabilityBytes:  cap,
+		Hub:              client,
+		Capability:       "x",
+	})
+	if res.Action != ActionReconciled {
+		t.Fatalf("Action = %v, want ActionReconciled (v1.1 always reconciles)", res.Action)
+	}
+	if len(res.NewPayloadMasterKey) != payload.KeySize {
+		t.Fatalf("NewPayloadMasterKey length = %d, want %d", len(res.NewPayloadMasterKey), payload.KeySize)
+	}
+	if string(res.NewPayloadMasterKey) != string(contentKey) {
+		t.Errorf("NewPayloadMasterKey != content key from passphrase_wrap")
+	}
+	if len(res.NewMasterKey) != payload.KeySize {
+		t.Errorf("NewMasterKey (capability KEK) length = %d", len(res.NewMasterKey))
+	}
+}
+
+func TestReconcile_V11_SaltRotation_ReencryptsCapability(t *testing.T) {
+	pass := "test"
+	dir := t.TempDir()
+	body, canonicalSalt, contentKey := makeV11Doc(t, pass)
+
+	// Local salt is DIFFERENT from canonical → reconciler must re-encrypt
+	// capability under the new KEK.
+	localSalt := make([]byte, 16)
+	for i := range localSalt {
+		localSalt[i] = 0xAA
+	}
+	localKEK := kdf.DerivePassphraseKEK(pass, localSalt, 600_000)
+	cap := []byte("CAP")
+	cfgPath, cfg := seedCfg(t, dir, localKEK, localSalt, cap)
+
+	h := newFakeHub(t, "bk_test")
+	h.body = body
+	client := httpc.New(h.ts.URL)
+
+	res := Reconcile(context.Background(), ReconcileInput{
+		CfgPath:          cfgPath,
+		Cfg:              cfg,
+		Passphrase:       pass,
+		CurrentMasterKey: localKEK,
+		CapabilityBytes:  cap,
+		Hub:              client,
+		Capability:       "x",
+	})
+	if res.Action != ActionReconciled {
+		t.Fatalf("Action = %v, want ActionReconciled", res.Action)
+	}
+	if string(res.NewPayloadMasterKey) != string(contentKey) {
+		t.Errorf("content key mismatch")
+	}
+	got, _ := base64.StdEncoding.DecodeString(cfg.Crate.Salt)
+	if string(got) != string(canonicalSalt) {
+		t.Errorf("cfg.Salt not updated to canonical")
+	}
+	// New sealed capability must decrypt under the canonical-KEK (NewMasterKey).
+	sealed, _ := base64.StdEncoding.DecodeString(cfg.Crate.PairingToken)
+	nonce, _ := base64.StdEncoding.DecodeString(cfg.Crate.CapabilityNonce)
+	plain, err := sdkcrypto.Open(res.NewMasterKey, nonce, sealed, nil)
+	if err != nil {
+		t.Fatalf("Open re-sealed capability: %v", err)
+	}
+	if string(plain) != string(cap) {
+		t.Errorf("re-sealed capability != original")
+	}
+}
+
+func TestReconcile_V11_WrongPassphrase_Fails(t *testing.T) {
+	body, saltBytes, _ := makeV11Doc(t, "the-right-passphrase")
+	dir := t.TempDir()
+	wrongPass := "wrong-passphrase"
+	junkKEK := make([]byte, payload.KeySize)
+	cap := []byte("CAP")
+	cfgPath, cfg := seedCfg(t, dir, junkKEK, saltBytes, cap)
+
+	h := newFakeHub(t, "bk_test")
+	h.body = body
+	client := httpc.New(h.ts.URL)
+
+	res := Reconcile(context.Background(), ReconcileInput{
+		CfgPath:          cfgPath,
+		Cfg:              cfg,
+		Passphrase:       wrongPass,
+		CurrentMasterKey: junkKEK,
+		CapabilityBytes:  cap,
+		Hub:              client,
+		Capability:       "x",
+	})
+	if res.Action != ActionFailed {
+		t.Errorf("Action = %v, want ActionFailed (wrong passphrase should fail unwrap)", res.Action)
 	}
 }

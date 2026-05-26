@@ -197,6 +197,12 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	// yet, in which case the reconciler returns ActionAbsent and the daemon
 	// proceeds with its local salt. When the browser DOES write the file,
 	// the next start aligns the master key with the canonical salt.
+	//
+	// v1.1: reconcile additionally unwraps the content key (NewPayloadMasterKey).
+	// The capability KEK (masterKey) stays distinct from the payload master
+	// key (payloadKey, declared just below). For v1.0 vaults the two are the
+	// same key; payloadKey aliases masterKey.
+	var payloadKey []byte
 	{
 		reconCtx, reconCancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 		res := cratejson.Reconcile(reconCtx, cratejson.ReconcileInput{
@@ -219,6 +225,17 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		case cratejson.ActionAbsent, cratejson.ActionAlreadyCanonical, cratejson.ActionFailed:
 			// Nothing to do.
 		}
+		if res.NewPayloadMasterKey != nil {
+			// v1.1 vault: distinct payload key (unwrapped content key from
+			// passphrase_wrap). Schedule zeroing on shutdown.
+			payloadKey = res.NewPayloadMasterKey
+			defer zeroBytes(payloadKey)
+		}
+	}
+	if payloadKey == nil {
+		// v1.0 vault (or v1.1 reconciliation failed): payload key == capability
+		// KEK == masterKey. Same backing array; masterKey's defer covers it.
+		payloadKey = masterKey
 	}
 	// Now that reconciliation is done, the plaintext capability + passphrase
 	// can be wiped — the syncer holds the base64-encoded liveCapability for
@@ -248,7 +265,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		BucketID:                 cfg.Crate.BucketID,
 		CapabilityRef:            &liveCapability,
 		CapabilityMu:             sharedCapabilityMu,
-		MasterKeyRef:             &masterKey,
+		MasterKeyRef:             &payloadKey,
 		ManifestRef:              sharedManifest,
 		ManifestMu:               sharedManifestMu,
 		ManifestETagRef:          &sharedManifestETag,
@@ -282,7 +299,7 @@ func runStart(cmd *cobra.Command, _ []string) error {
 		BucketID:                 cfg.Crate.BucketID,
 		CapabilityRef:            &liveCapability,
 		CapabilityMu:             sharedCapabilityMu,
-		MasterKeyRef:             &masterKey,
+		MasterKeyRef:             &payloadKey,
 		ManifestRef:              sharedManifest,
 		ManifestMu:               sharedManifestMu,
 		ManifestETagRef:          &sharedManifestETag,
