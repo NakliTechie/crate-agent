@@ -8,11 +8,11 @@
 //
 // Architecture:
 //
-//   watcher.Events() ─→ dispatcher ─→ upload_queue ─→ worker ─→ Hub PUT/DELETE
-//                                          │            │
-//                                       (state.db)   manifest_cache (success)
-//                                                       │
-//                                                    backoff (failure)
+//	watcher.Events() ─→ dispatcher ─→ upload_queue ─→ worker ─→ Hub PUT/DELETE
+//	                                       │            │
+//	                                    (state.db)   manifest_cache (success)
+//	                                                    │
+//	                                                 backoff (failure)
 //
 // Crash safety:
 //   - Every watcher event is persisted to upload_queue before the worker
@@ -37,7 +37,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"mime"
 	"os"
 	"path/filepath"
@@ -711,12 +710,19 @@ func (s *Syncer) computeBackoff(attempts int) time.Duration {
 	if attempts < 1 {
 		attempts = 1
 	}
-	mult := math.Pow(2, float64(attempts-1))
-	d := time.Duration(float64(s.cfg.BackoffBase) * mult)
-	if d > s.cfg.BackoffCap {
-		d = s.cfg.BackoffCap
+	delay := s.cfg.BackoffBase
+	if delay >= s.cfg.BackoffCap {
+		return s.cfg.BackoffCap
 	}
-	return d
+	for attempt := 1; attempt < attempts; attempt++ {
+		// Cap before doubling so large attempt counts cannot overflow
+		// time.Duration. Float-to-int overflow differs across platforms.
+		if delay > s.cfg.BackoffCap/2 {
+			return s.cfg.BackoffCap
+		}
+		delay *= 2
+	}
+	return delay
 }
 
 // envelopeMsg extracts a human-readable error message from a Hub response,
