@@ -18,13 +18,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: crate-agent
+
+      - name: Check out private-mesh dependency
+        uses: actions/checkout@v5
+        with:
+          repository: NakliTechie/private-mesh
+          path: private-mesh
 
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
           check-latest: true
+          cache-dependency-path: crate-agent/go.sum
 
       - name: Cross-compile (darwin + linux × amd64 + arm64)
+        working-directory: crate-agent
         run: |
           # VERSION embeds the tag into the binary via -ldflags so
           # `crate-agent version` reports the release tag.
@@ -32,6 +42,7 @@ jobs:
           ls -la dist/
 
       - name: Compute SHA-256 checksums
+        working-directory: crate-agent
         run: |
           cd dist
           for f in crate-agent-*; do
@@ -44,11 +55,11 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/crate-agent-darwin-amd64
-            dist/crate-agent-darwin-arm64
-            dist/crate-agent-linux-amd64
-            dist/crate-agent-linux-arm64
-            dist/crate-agent-darwin-amd64.sha256
-            dist/crate-agent-darwin-arm64.sha256
-            dist/crate-agent-linux-amd64.sha256
-            dist/crate-agent-linux-arm64.sha256
+            crate-agent/dist/crate-agent-darwin-amd64
+            crate-agent/dist/crate-agent-darwin-arm64
+            crate-agent/dist/crate-agent-linux-amd64
+            crate-agent/dist/crate-agent-linux-arm64
+            crate-agent/dist/crate-agent-darwin-amd64.sha256
+            crate-agent/dist/crate-agent-darwin-arm64.sha256
+            crate-agent/dist/crate-agent-linux-amd64.sha256
+            crate-agent/dist/crate-agent-linux-arm64.sha256
