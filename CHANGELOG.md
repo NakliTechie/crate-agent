@@ -4,6 +4,24 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-27
+
+### Added — v1.1 dual-wrap vault support
+
+- Read and validate the browser's v1.1 `.crate/crate.json` schema, including
+  strict `passphrase_wrap` and optional `recovery_wrap` validation.
+- Derive a passphrase KEK separately from the random content key, then unwrap
+  that content key for payload encryption and manifest signing.
+- Reconcile both v1.0 and v1.1 vaults without changing the established v1.0
+  path. Existing vaults continue to sync unchanged.
+- Re-encrypt the local transport capability when the browser rotates the
+  passphrase-wrap salt while keeping the vault's content key stable.
+- Cover v1.1 schema parsing, validation, reconciliation, key wrapping,
+  wrong-passphrase rejection, and tamper rejection with new tests.
+
+This release is the daemon prerequisite for browser-created v1.1 recovery
+vaults. Older crate-agent releases cannot sync those vaults.
+
 ## [1.0.1] — 2026-05-21
 
 ### Security — second round (manifest rollback + full scope-subset)
