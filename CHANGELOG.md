@@ -22,6 +22,11 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 This release is the daemon prerequisite for browser-created v1.1 recovery
 vaults. Older crate-agent releases cannot sync those vaults.
 
+### Fixed
+
+- Cap exponential upload backoff before multiplying `time.Duration`, avoiding
+  platform-dependent overflow after very large retry counts.
+
 ## [1.0.1] — 2026-05-21
 
 ### Security — second round (manifest rollback + full scope-subset)
