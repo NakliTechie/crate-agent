@@ -338,3 +338,19 @@ func TestStats(t *testing.T) {
 		t.Errorf("Stats: %+v", s)
 	}
 }
+
+// A vault entry under .crate/ (a state DB leaked by a pre-1.3 daemon) must
+// never be written into the local folder, where .crate/ holds this
+// daemon's own SQLite files.
+func TestPuller_SkipsIgnoredVaultPaths(t *testing.T) {
+	r := setupPuller(t)
+	r.publishFile(t, "/.crate/state.db-wal", []byte("not a wal"))
+	r.publishFile(t, "/real.txt", []byte("real"))
+	r.puller.tick(context.Background())
+	if _, err := os.Stat(filepath.Join(r.localPath, ".crate", "state.db-wal")); err == nil {
+		t.Fatal("leaked .crate/state.db-wal was mirrored over the daemon's own state dir")
+	}
+	if _, err := os.Stat(filepath.Join(r.localPath, "real.txt")); err != nil {
+		t.Fatalf("real file not mirrored: %v", err)
+	}
+}

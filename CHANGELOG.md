@@ -4,6 +4,18 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-09-10
+
+### Fixed
+
+- **The puller no longer mirrors vault entries the daemon itself ignores.**
+  A `.crate/state.db-wal` leaked into a vault by a pre-1.3 daemon was pulled
+  back down into `<local>/.crate/` — the directory holding this daemon's own
+  live SQLite files. Vault paths matching the built-in ignore list
+  (`.crate/`, `*.tmp.*`) are now skipped with a warning.
+- The skip added in 1.3.0 for unchanged bytes logged as `uploaded`; it now
+  logs `skipped: bytes unchanged since last sync`.
+
 ## [1.3.0] — 2026-09-10
 
 ### Added — carrier transport (`transport_type = "carrier"`)

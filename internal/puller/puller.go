@@ -45,6 +45,7 @@ import (
 
 	"github.com/NakliTechie/crate-agent/internal/cratejson"
 	"github.com/NakliTechie/crate-agent/internal/httpc"
+	"github.com/NakliTechie/crate-agent/internal/ignore"
 	"github.com/NakliTechie/crate-agent/internal/manifest"
 	"github.com/NakliTechie/crate-agent/internal/payload"
 	"github.com/NakliTechie/crate-agent/internal/state"
@@ -96,8 +97,13 @@ type Config struct {
 
 // Puller drives the periodic pull-side reconciliation loop.
 type Puller struct {
-	cfg          Config
-	logger       *slog.Logger
+	cfg    Config
+	logger *slog.Logger
+	// ignore holds the built-in always-ignore patterns. A vault entry that
+	// matches them (".crate/…", "*.tmp.*") is never materialised locally:
+	// ".crate/" is where this daemon's own state DB lives, so pulling a
+	// leaked ".crate/state.db-wal" would land on top of a live SQLite WAL.
+	ignore       *ignore.Matcher
 	now          func() time.Time
 	pollInterval time.Duration
 	slackNs      int64
@@ -141,6 +147,7 @@ func New(cfg Config) (*Puller, error) {
 		return nil, errors.New("puller: State required")
 	}
 	p := &Puller{
+		ignore:       ignore.New(),
 		cfg:          cfg,
 		logger:       cfg.Logger,
 		now:          cfg.Now,
@@ -260,6 +267,10 @@ func (p *Puller) tick(ctx context.Context) {
 	// so tombstone detection compares apples-to-apples.
 	seenPaths := make(map[string]struct{}, len(tree))
 	for path, entry := range tree {
+		if p.ignore.Match(strings.TrimPrefix(path, "/"), entry.IsDir) {
+			p.logger.Warn("vault entry matches the built-in ignore list; not mirrored", "path", path)
+			continue
+		}
 		seenPaths[stripLeadingSlash(path)] = struct{}{}
 		if path == cratejson.CratePath || path == manifest.Path {
 			continue // skip metadata paths

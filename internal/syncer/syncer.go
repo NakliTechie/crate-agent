@@ -57,6 +57,11 @@ import (
 
 func bytesReader(b []byte) io.Reader { return bytes.NewReader(b) }
 
+// errUnchanged is returned by executePut when the file's bytes are exactly
+// what manifest_cache recorded as last synced — nothing to upload. The
+// worker treats it as success and logs it as a skip, not an upload.
+var errUnchanged = errors.New("syncer: bytes unchanged since last sync")
+
 func decodeB64(s string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(s)
 }
@@ -319,7 +324,15 @@ func (s *Syncer) workOneDue(ctx context.Context) bool {
 	if row == nil {
 		return false
 	}
-	if err := s.executeRow(ctx, row); err != nil {
+	err = s.executeRow(ctx, row)
+	if errors.Is(err, errUnchanged) {
+		if mErr := s.cfg.State.MarkUploadAttempt(ctx, row.QueueID, "", time.Time{}); mErr != nil {
+			s.logger.Error("MarkUploadAttempt(skip) failed", "queue_id", row.QueueID, "err", mErr)
+		}
+		s.logger.Info("skipped: bytes unchanged since last sync", "queue_id", row.QueueID, "rel", row.RemotePath)
+		return true
+	}
+	if err != nil {
 		// On a context cancel, don't update DB — the cancel is the signal
 		// to stop, and we want the row to be retried next run.
 		if errors.Is(err, context.Canceled) {
@@ -395,8 +408,7 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 		if uerr := s.cfg.State.UpsertManifestEntry(ctx, *cached); uerr != nil {
 			s.logger.Warn("manifest_cache mtime refresh failed", "rel", row.RemotePath, "err", uerr)
 		}
-		s.logger.Info("skipped: bytes unchanged since last sync", "rel", row.RemotePath, "uuid", cached.UUID)
-		return nil
+		return errUnchanged
 	}
 
 	cap := s.readCapability()
