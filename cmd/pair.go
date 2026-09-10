@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -49,6 +50,7 @@ func init() {
 	pairCmd.Flags().Bool("token-stdin", false, "Read the CRATE-PAIR token from stdin (first line)")
 	pairCmd.Flags().Bool("passphrase-stdin", false, "Read the passphrase from stdin (second line after token if --token-stdin, else first)")
 	pairCmd.Flags().Bool("skip-doctor", false, "Skip the auto-doctor step at the end (testing only)")
+	pairCmd.Flags().String("carrier", "", "Pair with a crate-carrier Worker at this https:// URL instead of redeeming a token; the first stdin/prompt line is then the Worker's CARRIER_SECRET")
 }
 
 func runPair(cmd *cobra.Command, _ []string) error {
@@ -59,6 +61,7 @@ func runPair(cmd *cobra.Command, _ []string) error {
 	tokenStdin, _ := cmd.Flags().GetBool("token-stdin")
 	passStdin, _ := cmd.Flags().GetBool("passphrase-stdin")
 	skipDoctor, _ := cmd.Flags().GetBool("skip-doctor")
+	carrierURL, _ := cmd.Flags().GetString("carrier")
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -75,13 +78,26 @@ func runPair(cmd *cobra.Command, _ []string) error {
 		localPath = filepath.Join(home, "crate")
 	}
 
-	// --- Step 1: read the CRATE-PAIR token ----------------------------
+	// --- Step 1: read the CRATE-PAIR token (or the carrier secret) ------
 	stdin := bufio.NewReader(os.Stdin)
+	carrier := carrierURL != ""
+	if carrier {
+		u, perr := url.Parse(carrierURL)
+		if perr != nil || u.Scheme != "https" || u.Host == "" {
+			return exitErr(exitConfigError, fmt.Errorf("--carrier must be an https:// URL, got %q", carrierURL))
+		}
+		carrierURL = strings.TrimRight(carrierURL, "/")
+	}
 	var rawToken string
 	if tokenStdin {
 		rawToken, err = readLine(stdin)
 		if err != nil {
 			return exitErr(exitGeneric, fmt.Errorf("read token from stdin: %w", err))
+		}
+	} else if carrier {
+		rawToken, err = promptPassphrase("Carrier secret (CARRIER_SECRET): ")
+		if err != nil {
+			return exitErr(exitGeneric, err)
 		}
 	} else {
 		fmt.Print("Paste pairing token: ")
@@ -92,14 +108,24 @@ func runPair(cmd *cobra.Command, _ []string) error {
 	}
 
 	// --- Step 2: decode + validate -----------------------------------
-	tok, err := pairing.Decode(rawToken)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "✗", pairing.RecoveryMessage(err))
-		return exitErr(exitGeneric, err)
-	}
-	if err := pairing.Validate(tok, time.Now()); err != nil {
-		fmt.Fprintln(os.Stderr, "✗", pairing.RecoveryMessage(err))
-		return exitErr(exitGeneric, err)
+	// A carrier has no token: the secret IS the capability, the Worker
+	// URL IS the transport, and there is nothing to redeem.
+	var tok *pairing.Token
+	if carrier {
+		if strings.TrimSpace(rawToken) == "" {
+			return exitErr(exitGeneric, errors.New("carrier secret is empty"))
+		}
+		tok = &pairing.Token{TransportEndpoint: carrierURL, TransportType: httpc.TransportCarrier, Secret: strings.TrimSpace(rawToken)}
+	} else {
+		tok, err = pairing.Decode(rawToken)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "✗", pairing.RecoveryMessage(err))
+			return exitErr(exitGeneric, err)
+		}
+		if err := pairing.Validate(tok, time.Now()); err != nil {
+			fmt.Fprintln(os.Stderr, "✗", pairing.RecoveryMessage(err))
+			return exitErr(exitGeneric, err)
+		}
 	}
 
 	// --- Step 3: generate ephemeral Ed25519 keypair -------------------
@@ -134,10 +160,33 @@ func runPair(cmd *cobra.Command, _ []string) error {
 		Hostname:     hostnameOrUnknown(),
 		AgentVersion: binaryVersion,
 	}
-	client := httpc.New(tok.TransportEndpoint)
 	ctx, cancel := context.WithTimeout(cmd.Context(), 30*time.Second)
 	defer cancel()
-	result, err := pairing.Phase3(ctx, client, tok.Secret, daemonPubkey, fp)
+	var result *pairing.RedeemResult
+	if carrier {
+		// Prove the secret against the Worker before writing anything:
+		// HEAD of crate.json is 200 or 404 with the right secret, 401 without.
+		probe := httpc.NewCarrier(tok.TransportEndpoint, tok.Secret)
+		hr, herr := probe.HeadObject(ctx, "carrier", ".crate/crate.json", "")
+		if herr != nil {
+			fmt.Fprintln(os.Stderr, "✗ Carrier unreachable:", herr)
+			return exitErr(exitTransportDown, herr)
+		}
+		if hr.Status == http.StatusUnauthorized {
+			err = errors.New("carrier rejected the secret (401) — it must match the Worker's CARRIER_SECRET")
+			fmt.Fprintln(os.Stderr, "✗", err)
+			return exitErr(exitGeneric, err)
+		}
+		if hr.Status != http.StatusOK && hr.Status != http.StatusNotFound {
+			err = fmt.Errorf("carrier HEAD .crate/crate.json returned HTTP %d", hr.Status)
+			fmt.Fprintln(os.Stderr, "✗", err)
+			return exitErr(exitGeneric, err)
+		}
+		result = &pairing.RedeemResult{Capability: []byte(tok.Secret), BucketReference: "carrier"}
+	} else {
+		client := httpc.New(tok.TransportEndpoint)
+		result, err = pairing.Phase3(ctx, client, tok.Secret, daemonPubkey, fp)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "✗", pairing.RecoveryMessage(err))
 		// Per spec §"CLI commands" exit codes: 3 is reserved for
@@ -210,13 +259,16 @@ func runPair(cmd *cobra.Command, _ []string) error {
 		_ = passphrase[i] // strings are immutable; cannot zero. Note this in docs.
 	}
 
-	expires := time.Unix(result.ExpiresAtUnix, 0).UTC().Format(time.RFC3339)
 	fmt.Println()
 	fmt.Println("✓ Paired with", redactedEndpoint(tok.TransportEndpoint))
 	fmt.Println("  Bucket:           ", result.BucketReference)
 	fmt.Println("  Identity key:     ", idPath, "(mode 0600)")
 	fmt.Println("  Config:           ", cfgPath, "(mode 0600)")
-	fmt.Println("  Capability expires:", expires)
+	if carrier {
+		fmt.Println("  Capability expires: never (carrier secret; rotate CARRIER_SECRET on the Worker to revoke)")
+	} else {
+		fmt.Println("  Capability expires:", time.Unix(result.ExpiresAtUnix, 0).UTC().Format(time.RFC3339))
+	}
 
 	// --- Step 11: auto-doctor ---------------------------------------
 	if skipDoctor {

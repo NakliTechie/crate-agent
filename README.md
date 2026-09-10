@@ -2,7 +2,7 @@
 
 A small Go daemon that keeps a local folder (`~/crate/` by default) in sync with your [Crate](https://crate.naklios.dev/) cloud folder. Cloud is canonical; the daemon is a continuously-updated local mirror. macOS + Linux today; Windows is on the v1.x roadmap.
 
-**The daemon never holds your bucket credentials.** It authenticates to a transport (`nakli-hub` or `nakli-cf-worker`) via a pairing token issued by the browser Crate. That's a security property, not a layering accident — losing the daemon doesn't expose your R2 access keys.
+**The daemon never holds your R2 access keys.** It authenticates to a transport — `nakli-hub` / `nakli-cf-worker` via a pairing token issued by the browser Crate, or your own [crate-carrier](https://github.com/NakliTechie/crate-carrier) Worker via its shared secret (`crate-agent pair --carrier https://<your-worker>`). Either way the daemon can reach ciphertext only; losing the daemon doesn't expose your bucket credentials, and a carrier is revoked by rotating `CARRIER_SECRET` on the Worker.
 
 For an illustrated walk-through of pairing the daemon with your Crate folder, see the [user guide § The desktop daemon](https://crate.naklios.dev/guide/#daemon). What follows is the terse install + reference.
 

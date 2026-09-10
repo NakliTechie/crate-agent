@@ -16,19 +16,33 @@ package httpc
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// Client speaks HTTP to a fabric transport. Construct via New.
+// Client speaks HTTP to a fabric transport (nakli-hub / nakli-cf-worker),
+// or — when carrierSecret is set — to a crate-carrier Worker
+// (github.com/NakliTechie/crate-carrier). The carrier is the user's own
+// Worker holding an R2 binding; objects live at /o/<key>, every request is
+// signed with x-crate-{ts,nonce,sig} = HMAC-SHA256(secret,
+// "METHOD\npath\nsorted-query\nts\nnonce"), and the capability
+// argument on the object methods is ignored. Same call sites, second wire.
 type Client struct {
-	endpoint string
-	http     *http.Client
+	endpoint      string
+	carrier       bool   // routes + health path for a crate-carrier
+	carrierSecret string // "" ⇒ unauthenticated carrier calls only (Health)
+	http          *http.Client
 	// deviceID is the value the Hub bound to this daemon's capability via
 	// the `device-id == ...` caveat at pair time. It is sent as the
 	// X-Fabric-Device-Id header on every authenticated request so the
@@ -50,6 +64,60 @@ func New(endpoint string) *Client {
 	}
 }
 
+// NewCarrier builds a client for a crate-carrier Worker. secret is the
+// Worker's CARRIER_SECRET; pass "" for unauthenticated calls only (Health).
+func NewCarrier(endpoint, secret string) *Client {
+	c := New(endpoint)
+	c.carrier = true
+	c.carrierSecret = secret
+	return c
+}
+
+// NewFor picks the client by config transport_type.
+func NewFor(transportType, endpoint, carrierSecret string) *Client {
+	if transportType == TransportCarrier {
+		return NewCarrier(endpoint, carrierSecret)
+	}
+	return New(endpoint)
+}
+
+// TransportCarrier is the config transport_type for a crate-carrier Worker.
+const TransportCarrier = "carrier"
+
+// IsCarrier reports whether this client signs for a crate-carrier.
+func (c *Client) IsCarrier() bool { return c.carrier }
+
+// carrierCanonical is the exact string the Worker verifies. Query pairs
+// are sorted by key then value, values decoded — matching URLSearchParams
+// iteration in the browser's lib/bucket.js and the Worker's lib.js.
+func carrierCanonical(method, path string, query url.Values, ts, nonce string) string {
+	var pairs []string
+	for k, vs := range query {
+		for _, v := range vs {
+			pairs = append(pairs, k+"="+v)
+		}
+	}
+	sort.Strings(pairs)
+	return strings.Join([]string{strings.ToUpper(method), path, strings.Join(pairs, "&"), ts, nonce}, "\n")
+}
+
+// carrierSign returns the three signature header values for a request.
+// ts is unix milliseconds; nonce is random unless supplied (tests).
+func carrierSign(secret, method, path string, query url.Values, ts, nonce string) map[string]string {
+	if nonce == "" {
+		b := make([]byte, 12)
+		_, _ = rand.Read(b)
+		nonce = hex.EncodeToString(b)
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(carrierCanonical(method, path, query, ts, nonce)))
+	return map[string]string{
+		"x-crate-ts":    ts,
+		"x-crate-nonce": nonce,
+		"x-crate-sig":   hex.EncodeToString(mac.Sum(nil)),
+	}
+}
+
 // SetDeviceID attaches the daemon's device-id (the value bound by the
 // `device-id == ...` caveat at pair time). After this call, every
 // authenticated request also sends X-Fabric-Device-Id, satisfying the
@@ -62,10 +130,28 @@ func (c *Client) SetDeviceID(id string) {
 // Used by every authenticated request path so the device-id binding is
 // applied consistently.
 func (c *Client) setAuthHeaders(req *http.Request, capability string) {
+	if c.carrier {
+		if c.carrierSecret == "" {
+			return // unauthenticated carrier call; the Worker will answer 401 if it needed a signature
+		}
+		ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		for k, v := range carrierSign(c.carrierSecret, req.Method, req.URL.EscapedPath(), req.URL.Query(), ts, "") {
+			req.Header.Set(k, v)
+		}
+		return
+	}
 	req.Header.Set("X-Fabric-Grant", capability)
 	if c.deviceID != "" {
 		req.Header.Set("X-Fabric-Device-Id", c.deviceID)
 	}
+}
+
+// objectPath is where an object lives on this transport.
+func (c *Client) objectPath(bucketID, remotePath string) string {
+	if c.carrier {
+		return "/o/" + escapeObjectPath(remotePath)
+	}
+	return "/v1/crate/object/" + url.PathEscape(bucketID) + "/" + escapeObjectPath(remotePath)
 }
 
 // Envelope matches the response shape from fabric-spec-001 §"Response
@@ -79,9 +165,25 @@ type Envelope struct {
 }
 
 // EnvelopeError is the `error` slot of an envelope when `ok: false`.
+// The Hub sends {code, message}; a crate-carrier sends a plain string.
 type EnvelopeError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+func (e *EnvelopeError) UnmarshalJSON(b []byte) error {
+	var msg string
+	if err := json.Unmarshal(b, &msg); err == nil {
+		e.Code, e.Message = "carrier", msg
+		return nil
+	}
+	type plain EnvelopeError
+	var p plain
+	if err := json.Unmarshal(b, &p); err != nil {
+		return err
+	}
+	*e = EnvelopeError(p)
+	return nil
 }
 
 // Response wraps a parsed envelope alongside the raw HTTP status.
@@ -103,6 +205,9 @@ type Response struct {
 // callers decide what to do based on `resp.Status` and `resp.Envelope.OK`.
 // Returns (nil, err) on transport-level failures (DNS, timeout, etc.).
 func (c *Client) Health(ctx context.Context) (*Response, error) {
+	if c.IsCarrier() {
+		return c.get(ctx, "/health")
+	}
 	return c.get(ctx, "/fabric/v1/health")
 }
 
@@ -201,7 +306,7 @@ func (c *Client) PutObjectIfMatch(
 	ifMatch string,
 	capability string,
 ) (*Response, error) {
-	path := "/v1/crate/object/" + url.PathEscape(bucketID) + "/" + escapeObjectPath(remotePath)
+	path := c.objectPath(bucketID, remotePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.endpoint+path, body)
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build PUT %s: %w", path, err)
@@ -232,7 +337,7 @@ func (c *Client) DeleteObject(
 	bucketID, remotePath string,
 	capability string,
 ) (*Response, error) {
-	path := "/v1/crate/object/" + url.PathEscape(bucketID) + "/" + escapeObjectPath(remotePath)
+	path := c.objectPath(bucketID, remotePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.endpoint+path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build DELETE %s: %w", path, err)
@@ -249,7 +354,7 @@ func (c *Client) HeadObject(
 	bucketID, remotePath string,
 	capability string,
 ) (*Response, error) {
-	path := "/v1/crate/object/" + url.PathEscape(bucketID) + "/" + escapeObjectPath(remotePath)
+	path := c.objectPath(bucketID, remotePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.endpoint+path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build HEAD %s: %w", path, err)
@@ -269,7 +374,7 @@ func (c *Client) GetObject(
 	bucketID, remotePath string,
 	capability string,
 ) (*Response, error) {
-	path := "/v1/crate/object/" + url.PathEscape(bucketID) + "/" + escapeObjectPath(remotePath)
+	path := c.objectPath(bucketID, remotePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("httpc: build GET %s: %w", path, err)
@@ -334,6 +439,9 @@ func (c *Client) doWithBody(req *http.Request, path string) (*Response, error) {
 	}
 	return out, nil
 }
+
+// jsonUnmarshal is json.Unmarshal, exposed for tests in this package.
+func jsonUnmarshal(b []byte, v interface{}) error { return json.Unmarshal(b, v) }
 
 // escapeObjectPath URL-encodes path segments individually so slashes in
 // the remote path survive untouched.

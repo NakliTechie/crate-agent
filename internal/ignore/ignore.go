@@ -43,6 +43,13 @@ type rule struct {
 // Per crate-daemon-handoff-v1.0.md §"Watcher behavior" + the M3 decision in
 // crate-agent/plan/pending.md.
 var builtinPatterns = []string{
+	// Crate's own metadata: the state DB lives at <local>/.crate/state.db
+	// by default, and the puller's atomic-write temp files sit beside the
+	// file they're about to become. Neither is user content. Found on the
+	// 2026-09-10 carrier walk: a fresh pair synced .crate/state.db-wal
+	// into the vault as a file.
+	".crate/",
+	"*.tmp.*",
 	".DS_Store",
 	"Thumbs.db",
 	"*.swp",

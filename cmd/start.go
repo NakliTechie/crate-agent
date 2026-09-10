@@ -181,7 +181,10 @@ func runStart(cmd *cobra.Command, _ []string) error {
 	defer func() { _ = w.Close() }()
 
 	// --- HTTP client -----------------------------------------------------
-	client := httpc.New(cfg.Crate.TransportEndpoint)
+	// For a crate-carrier the "capability" decrypted above IS the Worker's
+	// shared secret; the client signs every request with it and ignores
+	// the per-call capability argument.
+	client := httpc.NewFor(cfg.Crate.TransportType, cfg.Crate.TransportEndpoint, string(capabilityBytes))
 	// The daemon's capability carries `device-id == <daemon_pubkey>` from
 	// the pair-mint flow. Extract it and tell the client to send the
 	// matching X-Fabric-Device-Id header on every authenticated request,

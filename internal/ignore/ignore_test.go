@@ -119,3 +119,20 @@ func TestEmptyPathDoesNotMatch(t *testing.T) {
 		t.Errorf("\".\" should never match")
 	}
 }
+
+func TestBuiltinIgnoresCrateMetadataAndTempFiles(t *testing.T) {
+	m := New()
+	for _, rel := range []string{".crate/state.db", ".crate/state.db-wal", "walk-1mib.bin.tmp.01M24Z15R5Y73908B3GCQFADPS", "sub/file.txt.tmp.01ABC"} {
+		if !m.Match(rel, false) {
+			t.Errorf("%s should be ignored by default", rel)
+		}
+	}
+	if !m.Match(".crate", true) {
+		t.Error(".crate dir should be ignored by default")
+	}
+	for _, rel := range []string{"notes.txt", "photos/2026/a.jpg", "tmp.txt", "a.tmp"} {
+		if m.Match(rel, false) {
+			t.Errorf("%s must not be ignored", rel)
+		}
+	}
+}

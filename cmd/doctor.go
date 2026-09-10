@@ -24,12 +24,12 @@ import (
 //   4 = already running     5 = not running
 
 const (
-	exitOK              = 0
-	exitGeneric         = 1
-	exitConfigError     = 2
-	exitTransportDown   = 3
-	exitAlreadyRunning  = 4
-	exitNotRunning      = 5
+	exitOK             = 0
+	exitGeneric        = 1
+	exitConfigError    = 2
+	exitTransportDown  = 3
+	exitAlreadyRunning = 4
+	exitNotRunning     = 5
 )
 
 var doctorCmd = &cobra.Command{
@@ -116,7 +116,7 @@ func RunChecks(ctx context.Context, stdout, stderr io.Writer, cfgPath, passphras
 	// Check 3 — transport reachable.
 	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	client := httpc.New(cfg.Crate.TransportEndpoint)
+	client := httpc.NewFor(cfg.Crate.TransportType, cfg.Crate.TransportEndpoint, "")
 	resp, err := client.Health(timeoutCtx)
 	if err != nil {
 		fmt.Fprintln(stderr, "✗ Transport:", err)

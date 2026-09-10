@@ -4,6 +4,39 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
+### Added — carrier transport (`transport_type = "carrier"`)
+
+- `crate-agent pair --carrier https://<worker>` pairs with a
+  [crate-carrier](https://github.com/NakliTechie/crate-carrier) Worker instead
+  of redeeming a hub token: the first stdin/prompt line is the Worker's
+  `CARRIER_SECRET`, verified with a signed HEAD before anything is written.
+  The secret is stored where the hub capability goes — encrypted under the
+  passphrase-derived key in `pairing_token` — and never expires (rotate
+  `CARRIER_SECRET` on the Worker to revoke).
+- `internal/httpc`: the same client signs `x-crate-{ts,nonce,sig}` over
+  `METHOD\npath\nsorted-query\nts\nnonce` and routes objects to `/o/<key>`
+  when built with `NewCarrier`/`NewFor`. Puller, syncer, reconcile and doctor
+  are unchanged. The signature is tested against a vector produced by the
+  browser's `lib/bucket.js`.
+- Walked end to end against a Deploy-button-provisioned Worker: browser
+  upload → daemon mirror (SHA-256 match, ~5 s) → daemon write → browser read
+  (appeared via the sync poll, no refresh).
+
+**Doctrine note:** with a carrier the daemon holds the carrier secret. That
+is ciphertext-only access to the bucket, not an R2 API token; the README's
+"never holds your bucket credentials" wording is updated to say so.
+
+### Fixed — the daemon synced its own state DB into the vault
+
+`.crate/` and `*.tmp.*` are now built-in ignore patterns. The default state
+DB path is `<local>/.crate/state.db`, inside the watched folder, so a fresh
+pair uploaded `.crate/state.db-wal` as a vault file; the puller's atomic
+temp files were queued the same way. Seen on the carrier walk.
+
+**Known, not fixed here:** after the puller lands a file, the watcher sees
+the rename and the syncer re-uploads the identical bytes once (an echo, one
+extra version per pulled file). Tracked in `plan/pending.md`.
+
 ## [1.2.0] — 2026-09-10
 
 ### Added — chunked object framing (v2), matching crate browser `b9c5f87`
