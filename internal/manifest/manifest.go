@@ -48,11 +48,19 @@ func newErr(format string, a ...interface{}) error {
 // CanonicalJSON-via-map preserves the spec field names exactly.
 //
 // Per-op required fields (enforced by validateShape):
-//   create: uuid, path, size, data_key_iv, data_key_ct, content_iv
-//   update: uuid, content_iv, size
-//   delete: uuid
-//   move:   uuid, path
-//   mkdir:  path
+//
+//	create: uuid, path, size, data_key_iv, data_key_ct, content_iv [, chunk_size]
+//	update: uuid, content_iv, size [, chunk_size]
+//
+// chunk_size (optional, positive integer) marks the object body as the
+// chunked v2 framing (payload.SealObject / OpenObject); absent means the
+// legacy v1 single blob. It describes the CURRENT version, so an update
+// without it reverts the entry to v1 — a v1-only writer stays correct.
+// Being inside the signed event, the bucket cannot forge it.
+//
+//	delete: uuid
+//	move:   uuid, path
+//	mkdir:  path
 //
 // All ops carry v, ts, op, prev_sig, sig.
 type Event = map[string]interface{}
@@ -142,15 +150,16 @@ func (m *Manifest) Verify(masterKey []byte) (bool, int, string) {
 
 // Entry is the result of materialise. Folders surface with Path set + IsDir=true.
 type Entry struct {
-	Path       string
-	UUID       string
-	IsDir      bool
-	Size       int64
-	Mime       string
-	DataKeyIV  string // base64 (matches browser's data_key_iv)
-	DataKeyCT  string // base64
-	ContentIV  string // base64
-	TSUnixMs   int64
+	Path      string
+	UUID      string
+	IsDir     bool
+	Size      int64
+	Mime      string
+	DataKeyIV string // base64 (matches browser's data_key_iv)
+	DataKeyCT string // base64
+	ContentIV string // base64
+	ChunkSize int64  // 0 ⇒ v1 single-blob body; >0 ⇒ v2 chunked
+	TSUnixMs  int64
 }
 
 // Materialise replays the log into a map keyed by remote path. Folders
@@ -170,6 +179,7 @@ func (m *Manifest) Materialise() map[string]*Entry {
 				DataKeyIV: strField(e, "data_key_iv"),
 				DataKeyCT: strField(e, "data_key_ct"),
 				ContentIV: strField(e, "content_iv"),
+				ChunkSize: int64Field(e, "chunk_size"),
 				TSUnixMs:  int64Field(e, "ts"),
 			}
 			byUUID[entry.UUID] = entry
@@ -184,6 +194,7 @@ func (m *Manifest) Materialise() map[string]*Entry {
 			if iv := strField(e, "content_iv"); iv != "" {
 				entry.ContentIV = iv
 			}
+			entry.ChunkSize = int64Field(e, "chunk_size") // per-version: absent ⇒ v1
 			entry.TSUnixMs = int64Field(e, "ts")
 		case "delete":
 			uuid := strField(e, "uuid")
@@ -330,6 +341,16 @@ func UpdateEvent(uuid string, size int64, contentIV []byte) Event {
 	}
 }
 
+// WithChunkSize marks a create/update event as describing a v2 chunked
+// body. chunkSize <= 0 leaves the event untouched (v1), so the key is
+// omitted rather than written as 0 — v1 events stay byte-identical.
+func WithChunkSize(evt Event, chunkSize int64) Event {
+	if chunkSize > 0 {
+		evt["chunk_size"] = float64(chunkSize)
+	}
+	return evt
+}
+
 func DeleteEvent(uuid string) Event {
 	return Event{"op": "delete", "uuid": uuid}
 }
@@ -389,6 +410,9 @@ func validateShape(evt Event) error {
 		if _, ok := evt["size"].(float64); !ok {
 			return newErr("create event requires number size")
 		}
+		if err := validateChunkSize(evt); err != nil {
+			return err
+		}
 	case "update":
 		for _, k := range []string{"uuid", "content_iv"} {
 			if !hasNonEmptyString(evt, k) {
@@ -397,6 +421,9 @@ func validateShape(evt Event) error {
 		}
 		if _, ok := evt["size"].(float64); !ok {
 			return newErr("update event requires number size")
+		}
+		if err := validateChunkSize(evt); err != nil {
+			return err
 		}
 	case "delete":
 		if !hasNonEmptyString(evt, "uuid") {
@@ -426,6 +453,19 @@ func hasNonEmptyString(e Event, k string) bool {
 func strField(e Event, k string) string {
 	s, _ := e[k].(string)
 	return s
+}
+
+// validateChunkSize accepts an absent chunk_size, or a positive integer.
+func validateChunkSize(evt Event) error {
+	raw, present := evt["chunk_size"]
+	if !present {
+		return nil
+	}
+	f, ok := raw.(float64)
+	if !ok || f <= 0 || f != float64(int64(f)) {
+		return newErr("%s event chunk_size must be a positive integer", evt["op"])
+	}
+	return nil
 }
 
 func int64Field(e Event, k string) int64 {

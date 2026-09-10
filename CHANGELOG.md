@@ -4,6 +4,38 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
+### Added — chunked object framing (v2), matching crate browser `b9c5f87`
+
+- `payload.SealObject` / `payload.OpenObject`: files are sealed as
+  independent 8 MiB AES-256-GCM chunks, per-chunk AAD
+  `uuid:base64(IV_0):index:total`. Binding `IV_0` (the manifest-signed
+  `content_iv`) closes the cross-version splice per-chunk framing would
+  otherwise open; index and total close reorder and truncation; body
+  length is checked against the signed `size` before any decryption.
+- Manifest `create`/`update` events accept an optional `chunk_size`
+  (`manifest.WithChunkSize`); it is the v1/v2 discriminator, lives inside
+  the HMAC-signed event, and is per-version — an update without it
+  reverts the entry to v1. v1 events are emitted byte-identically.
+- The syncer writes v2. The puller reads both; v1 objects written by
+  older browsers or daemons remain readable.
+- Cross-surface test: `internal/payload/testdata/browser-v2.json` is an
+  object sealed by the browser's `lib/crypto.js`; the daemon must open
+  it. Regenerate with `node test/gen-cross-surface-fixture.mjs` in the
+  crate repo.
+
+### Fixed — puller now enforces the content_iv rollback anchor
+
+`OpenObject` refuses an object whose leading IV differs from the
+manifest-signed `content_iv`. Previously the puller decrypted whatever
+body the bucket returned for a UUID, so a bucket-only attacker could
+replay an older object and have it mirrored to `~/crate/` as stale
+plaintext. The browser closed this in its 2026-05 audit (H1); the daemon
+had not.
+
+**Compatibility:** this release is required to sync any file written by
+crate browser `b9c5f87` or later. Older daemons fail closed on v2 objects
+(auth error, not silent).
+
 ## [1.1.0] — 2026-07-27
 
 ### Added — v1.1 dual-wrap vault support

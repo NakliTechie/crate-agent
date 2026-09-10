@@ -328,9 +328,13 @@ func TestSyncer_UploadOnCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unwrap data key: %v", err)
 	}
-	got, err := payload.OpenFilePayload(dataKey, objBytes, entry.UUID)
+	civ, _ := base64StdDecode(entry.ContentIV)
+	if entry.ChunkSize != payload.ChunkSize {
+		t.Errorf("entry.ChunkSize = %d, want %d (daemon writes v2)", entry.ChunkSize, payload.ChunkSize)
+	}
+	got, err := payload.OpenObject(dataKey, objBytes, entry.UUID, entry.Size, civ, entry.ChunkSize)
 	if err != nil {
-		t.Fatalf("open file payload: %v", err)
+		t.Fatalf("open object: %v", err)
 	}
 	if string(got) != string(plain) {
 		t.Errorf("decrypted bytes mismatch:\n got:  %q\n want: %q", got, plain)

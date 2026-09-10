@@ -11,7 +11,18 @@
 //     AES-GCM with the file UUID as AAD.
 //   - HMAC-SHA256 over canonical-JSON (lex-sorted keys) for manifest sig.
 //
-// Object body layout: 12-byte IV || ciphertext || 16-byte GCM auth tag.
+// Object body layouts (both readable; v2 is what every write produces):
+//
+//	v1 (single blob):  IV(12) || AES-GCM(dataKey, plaintext, AAD=uuid)
+//	v2 (chunked):      chunk_0 || chunk_1 || … || chunk_{n-1}
+//	                   chunk_i = IV_i(12) || AES-GCM(dataKey, plaintext_i, AAD_i)
+//	                   AAD_i   = "<uuid>:<base64(IV_0)>:<i>:<n>"
+//	                   n       = ceil(size / chunk_size), minimum 1
+//
+// A manifest entry is v2 iff it carries chunk_size (inside the HMAC-signed
+// event). See SealObject / OpenObject below and the browser's
+// lib/crypto.js, which this file MATCHES byte-for-byte.
+//
 // (Go's AEAD interface appends the tag to ciphertext automatically; the
 // browser's SubtleCrypto does the same. Layouts are identical.)
 package payload
@@ -22,6 +33,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,9 +41,9 @@ import (
 )
 
 const (
-	KeySize  = 32 // 256-bit AES-GCM key
-	IVSize   = 12 // AES-GCM nonce
-	TagSize  = 16 // GCM auth tag
+	KeySize    = 32 // 256-bit AES-GCM key
+	IVSize     = 12 // AES-GCM nonce
+	TagSize    = 16 // GCM auth tag
 	DataKeyLen = 32
 )
 
@@ -45,8 +57,8 @@ func RandomBytes(n int) ([]byte, error) {
 	return b, nil
 }
 
-func RandomIV() ([]byte, error)       { return RandomBytes(IVSize) }
-func RandomDataKey() ([]byte, error)  { return RandomBytes(DataKeyLen) }
+func RandomIV() ([]byte, error)      { return RandomBytes(IVSize) }
+func RandomDataKey() ([]byte, error) { return RandomBytes(DataKeyLen) }
 
 // Zero wipes a byte slice. Use after a key is no longer needed.
 func Zero(b []byte) {
@@ -179,9 +191,9 @@ func UnwrapKey(kek, iv, ciphertext []byte) ([]byte, error) {
 	return out, nil
 }
 
-// SealFilePayload encrypts a file's plaintext bytes under dataKey + a
-// fresh IV. fileUUID bound as AAD. Returns the on-bucket object body:
-// 12-byte IV || ciphertext || 16-byte tag.
+// SealFilePayload produces the LEGACY v1 single-blob body. Writers use
+// SealObject; this remains so tests can fabricate v1 objects for the
+// read-compat path.
 func SealFilePayload(dataKey, plaintext []byte, fileUUID string) ([]byte, []byte, error) {
 	iv, err := RandomIV()
 	if err != nil {
@@ -197,8 +209,8 @@ func SealFilePayload(dataKey, plaintext []byte, fileUUID string) ([]byte, []byte
 	return iv, body, nil
 }
 
-// OpenFilePayload decrypts an on-bucket object body. body MUST be at least
-// IVSize+TagSize bytes; the first 12 are the IV, the rest is ciphertext+tag.
+// OpenFilePayload decrypts a v1 single-blob body. Callers should go
+// through OpenObject, which adds the content_iv anchor and v2 dispatch.
 func OpenFilePayload(dataKey, body []byte, fileUUID string) ([]byte, error) {
 	if len(body) < IVSize+TagSize {
 		return nil, fmt.Errorf("payload: body too short (%d < %d)", len(body), IVSize+TagSize)
@@ -206,6 +218,167 @@ func OpenFilePayload(dataKey, body []byte, fileUUID string) ([]byte, error) {
 	iv := body[:IVSize]
 	ct := body[IVSize:]
 	return Open(dataKey, iv, ct, []byte(fileUUID))
+}
+
+// --- v2 chunked object framing ----------------------------------------------
+//
+// Why every AAD field is load-bearing (mirrors lib/crypto.js):
+//   uuid  — a chunk from another file at the same index fails.
+//   IV_0  — a chunk from an OLDER VERSION of the same file at the same
+//           index fails. IV_0 is random per write and is the manifest-signed
+//           content_iv, so every chunk is bound to the version it was
+//           written in. Single-blob AAD=uuid never needed this; per-chunk
+//           framing does.
+//   i     — reorder fails.
+//   n     — truncation / extension fails, and so does a chunk sealed under
+//           a different total.
+// Chunk 0's own IV is IV_0, so content_iv keeps meaning "the object's
+// leading 12 bytes" for both formats and the rollback anchor (browser
+// 2026-05 audit H1) reads identically.
+
+// ChunkSize is the plaintext bytes per chunk for objects this daemon
+// writes. The value is recorded in the manifest, never assumed on read,
+// so the browser and daemon may differ.
+const ChunkSize int64 = 8 << 20
+
+// ChunkCount is ceil(size / chunkSize), minimum 1. An empty file is one
+// authenticated empty chunk, so "zero chunks" is never a valid object.
+func ChunkCount(size, chunkSize int64) (int64, error) {
+	if size < 0 {
+		return 0, fmt.Errorf("payload: size %d must be non-negative", size)
+	}
+	if chunkSize <= 0 {
+		return 0, fmt.Errorf("payload: chunk size %d must be positive", chunkSize)
+	}
+	n := (size + chunkSize - 1) / chunkSize
+	if n < 1 {
+		n = 1
+	}
+	return n, nil
+}
+
+// ChunkAAD is the canonical per-chunk AAD. Plain ASCII, standard padded
+// base64 — identical bytes to the browser's chunkAAD.
+func ChunkAAD(uuid string, contentIV []byte, index, total int64) []byte {
+	return []byte(fmt.Sprintf("%s:%s:%d:%d", uuid, base64.StdEncoding.EncodeToString(contentIV), index, total))
+}
+
+// SealObject encrypts plaintext into a v2 object body. Returns
+// (contentIV, body); contentIV is chunk 0's IV and must be recorded in the
+// manifest as content_iv alongside chunkSize.
+func SealObject(dataKey, plaintext []byte, uuid string, chunkSize int64) ([]byte, []byte, error) {
+	if uuid == "" {
+		return nil, nil, errors.New("payload: SealObject requires uuid")
+	}
+	total, err := ChunkCount(int64(len(plaintext)), chunkSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	aead, err := newGCM(dataKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	contentIV, err := RandomIV()
+	if err != nil {
+		return nil, nil, err
+	}
+	body := make([]byte, 0, int64(len(plaintext))+total*(IVSize+TagSize))
+	for i := int64(0); i < total; i++ {
+		iv := contentIV
+		if i > 0 {
+			if iv, err = RandomIV(); err != nil {
+				return nil, nil, err
+			}
+		}
+		lo := i * chunkSize
+		hi := lo + chunkSize
+		if hi > int64(len(plaintext)) {
+			hi = int64(len(plaintext))
+		}
+		body = append(body, iv...)
+		body = aead.Seal(body, iv, plaintext[lo:hi], ChunkAAD(uuid, contentIV, i, total))
+	}
+	return contentIV, body, nil
+}
+
+// OpenObject decrypts an object body using its manifest entry, dispatching
+// on chunkSize: 0 means the legacy v1 single-blob layout. Before any
+// decryption it enforces that the body's leading IV equals the
+// manifest-signed contentIV (the rollback anchor) and, for v2, that the
+// body length is exactly what size and chunkSize predict. contentIV may
+// be nil only for v1 entries written before the browser's 2026-05 audit
+// added the field; it is mandatory for v2.
+func OpenObject(dataKey, body []byte, uuid string, size int64, contentIV []byte, chunkSize int64) ([]byte, error) {
+	if uuid == "" {
+		return nil, errors.New("payload: OpenObject requires uuid")
+	}
+	if len(body) < IVSize {
+		return nil, fmt.Errorf("payload: body too short (%d < %d)", len(body), IVSize)
+	}
+	leading := body[:IVSize]
+
+	if chunkSize == 0 {
+		if contentIV != nil && !hmac.Equal(leading, contentIV) {
+			return nil, errors.New("payload: object IV does not match manifest content_iv (rollback or tamper)")
+		}
+		return OpenFilePayload(dataKey, body, uuid)
+	}
+
+	if chunkSize < 0 {
+		return nil, fmt.Errorf("payload: manifest chunk_size %d invalid", chunkSize)
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("payload: manifest size %d invalid", size)
+	}
+	if len(contentIV) != IVSize {
+		return nil, errors.New("payload: chunked entry requires a 12-byte content_iv")
+	}
+	if !hmac.Equal(leading, contentIV) {
+		return nil, errors.New("payload: object IV does not match manifest content_iv (rollback or tamper)")
+	}
+	total, err := ChunkCount(size, chunkSize)
+	if err != nil {
+		return nil, err
+	}
+	if want := size + total*(IVSize+TagSize); int64(len(body)) != want {
+		return nil, fmt.Errorf("payload: object length %d does not match manifest (size %d, %d chunks ⇒ %d)", len(body), size, total, want)
+	}
+	aead, err := newGCM(dataKey)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, size)
+	off := int64(0)
+	for i := int64(0); i < total; i++ {
+		ptLen := chunkSize
+		if rem := size - int64(len(out)); rem < ptLen {
+			ptLen = rem
+		}
+		iv := body[off : off+IVSize]
+		off += IVSize
+		ct := body[off : off+ptLen+TagSize]
+		off += ptLen + TagSize
+		pt, err := aead.Open(nil, iv, ct, ChunkAAD(uuid, contentIV, i, total))
+		if err != nil {
+			return nil, fmt.Errorf("payload: chunk %d of %d failed authentication", i, total)
+		}
+		if int64(len(pt)) != ptLen {
+			return nil, fmt.Errorf("payload: chunk %d decrypted to %d bytes, expected %d", i, len(pt), ptLen)
+		}
+		out = append(out, pt...)
+	}
+	return out, nil
+}
+
+func newGCM(key []byte) (cipher.AEAD, error) {
+	if len(key) != KeySize {
+		return nil, fmt.Errorf("payload: key length %d, want %d", len(key), KeySize)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("payload: aes.NewCipher: %w", err)
+	}
+	return cipher.NewGCM(block)
 }
 
 // --- HMAC-SHA256 (manifest signing) ----------------------------------------

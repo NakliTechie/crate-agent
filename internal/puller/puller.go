@@ -2,23 +2,23 @@
 // Package puller implements the pull side of crate-agent's sync loop in
 // the M3 (encrypted) wire format. The bucket holds:
 //
-//   .crate/crate.json                — salt + version metadata (cleartext)
-//   .crate/manifest.jsonl.enc        — encrypted signed JSONL event log
-//   objects/{uuid}                   — encrypted file payloads
+//	.crate/crate.json                — salt + version metadata (cleartext)
+//	.crate/manifest.jsonl.enc        — encrypted signed JSONL event log
+//	objects/{uuid}                   — encrypted file payloads
 //
 // Manifest is the source of truth — the puller no longer LISTs the
 // bucket. Every tick:
 //
-//   1. GET .crate/manifest.jsonl.enc
-//   2. AES-GCM-decrypt + parse JSONL
-//   3. Verify the prev_sig chain
-//   4. Materialise the tree
-//   5. For each entry: compare against manifest_cache (uuid + content_iv);
-//      mismatch ⇒ GET objects/{uuid}, unwrap data key, decrypt payload,
-//      atomic-write to disk at the canonical path
-//   6. For each cached row NOT in the materialised tree ⇒ remote tombstone;
-//      remove the local copy (unless local was modified since last sync,
-//      in which case keep local + log conflict)
+//  1. GET .crate/manifest.jsonl.enc
+//  2. AES-GCM-decrypt + parse JSONL
+//  3. Verify the prev_sig chain
+//  4. Materialise the tree
+//  5. For each entry: compare against manifest_cache (uuid + content_iv);
+//     mismatch ⇒ GET objects/{uuid}, unwrap data key, decrypt payload,
+//     atomic-write to disk at the canonical path
+//  6. For each cached row NOT in the materialised tree ⇒ remote tombstone;
+//     remove the local copy (unless local was modified since last sync,
+//     in which case keep local + log conflict)
 //
 // Conflict-rename + remote-deleted-local-kept logic carries over from the
 // pre-M3 puller; only the source-of-truth comparison changed.
@@ -370,10 +370,20 @@ func (p *Puller) downloadAndDecrypt(ctx context.Context, entry *manifest.Entry, 
 	}
 	defer payload.Zero(dataKey)
 
-	// Decrypt the file payload.
-	plain, err := payload.OpenFilePayload(dataKey, got.Body, entry.UUID)
+	// Decrypt the file payload. OpenObject dispatches v1 blob vs v2
+	// chunked on entry.ChunkSize and pins the body's leading IV to the
+	// manifest-signed content_iv, so a bucket-only replay of an older
+	// object body for the same UUID is rejected instead of mirrored to
+	// disk as stale plaintext (matches the browser's 2026-05 audit H1).
+	var contentIV []byte
+	if entry.ContentIV != "" {
+		if contentIV, err = decodeB64(entry.ContentIV); err != nil {
+			return fmt.Errorf("decode content_iv: %w", err)
+		}
+	}
+	plain, err := payload.OpenObject(dataKey, got.Body, entry.UUID, entry.Size, contentIV, entry.ChunkSize)
 	if err != nil {
-		return fmt.Errorf("open file payload: %w", err)
+		return fmt.Errorf("open object: %w", err)
 	}
 
 	// Atomic write: temp file in same dir, rename.

@@ -433,8 +433,8 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 	}
 	defer payload.Zero(dataKey)
 
-	// Encrypt the payload.
-	contentIV, body, err := payload.SealFilePayload(dataKey, plain, uuid)
+	// Encrypt the payload — v2 chunked framing (payload.SealObject).
+	contentIV, body, err := payload.SealObject(dataKey, plain, uuid, payload.ChunkSize)
 	if err != nil {
 		return fmt.Errorf("seal payload: %w", err)
 	}
@@ -495,17 +495,17 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 	var evtErr error
 	if !createPath {
 		_, evtErr = s.cfg.ManifestRef.Append(
-			manifest.UpdateEvent(uuid, int64(len(plain)), contentIV),
+			manifest.WithChunkSize(manifest.UpdateEvent(uuid, int64(len(plain)), contentIV), payload.ChunkSize),
 			masterKey,
 		)
 	} else {
 		_, evtErr = s.cfg.ManifestRef.Append(
-			manifest.CreateEvent(uuid, manifestPath, int64(len(plain)),
+			manifest.WithChunkSize(manifest.CreateEvent(uuid, manifestPath, int64(len(plain)),
 				mimeFromName(row.RemotePath),
 				decodeB64Must(dataKeyIVB64),
 				decodeB64Must(dataKeyCTB64),
 				contentIV,
-			),
+			), payload.ChunkSize),
 			masterKey,
 		)
 	}
