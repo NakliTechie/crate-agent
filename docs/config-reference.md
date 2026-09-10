@@ -29,8 +29,8 @@ v1.0 supports exactly one `[crate]` section. v1.3 promotes this to an array `[[c
 | `name` | string | Display name. User-chosen during `pair`. |
 | `local_path` | string (path) | Required. The folder being synced. |
 | `transport_endpoint` | string (URL) | Required. e.g. `https://my-account.workers.dev` or `http://127.0.0.1:7842` |
-| `transport_type` | string | `cf-worker`, `hub`, or `managed`. |
-| `pairing_token` | string | Encrypted blob bound to the identity key. Opaque from the user's view. Populated by `pair`. |
+| `transport_type` | string | `cf-worker`, `hub`, `managed`, or `carrier` (a crate-carrier Worker; `transport_endpoint` is its URL). |
+| `pairing_token` | string | Encrypted blob bound to the identity key. Opaque from the user's view. Populated by `pair`. For `carrier`, this is the Worker's `CARRIER_SECRET`, encrypted under the passphrase-derived key. |
 | `bucket_id` | string (ULID) | Opaque reference to the bucket. Not credentials — the daemon never sees S3 keys. |
 | `encrypt_at_rest` | bool | Default `false`. Plaintext locally is the default — encryption lands at M3. |
 

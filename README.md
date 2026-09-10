@@ -46,11 +46,18 @@ make all                # cross-compile all four targets → dist/
 
 ```sh
 # 1. Open your Crate in the browser (https://crate.naklios.dev/), unlock the
-#    folder, click "Pair an agent". The modal shows a CRATE-PAIR-… token.
-#    Copy it.
+#    folder, click "Pair an agent". For a one-click (carrier) folder the
+#    modal shows the exact command below and copies your carrier secret;
+#    for a hub-based folder it shows a CRATE-PAIR-… token.
 
-# 2. Pair the daemon to that folder. You'll be prompted for the token
-#    + your folder passphrase.
+# 2a. One-click folder: pair with the Worker. Prompts for the carrier
+#     secret + your folder passphrase, verifies against the Worker.
+crate-agent pair --carrier https://crate-carrier-<you>.workers.dev
+# Carrier secret (CARRIER_SECRET): ********
+# Folder passphrase: ********
+# ✓ Paired with https://crate-carrier-<you>.workers.dev
+
+# 2b. Hub-based folder: redeem the token.
 crate-agent pair
 # Paste pairing token: CRATE-PAIR-…
 # Folder passphrase: ********
@@ -78,7 +85,7 @@ crate-agent uninstall-service    # remove the unit
 
 | Command | What |
 |---|---|
-| `crate-agent pair` | Redeem a CRATE-PAIR-… token from the browser. Writes config + identity key. |
+| `crate-agent pair` | Redeem a CRATE-PAIR-… token from the browser, or `--carrier <url>` to pair with a crate-carrier Worker by its secret. Writes config + identity key. |
 | `crate-agent start` | Run the watcher + sync loop + capability-refresh runner. Ctrl-C to stop gracefully. |
 | `crate-agent stop` | Signal the running daemon to terminate (reads `$XDG_STATE_HOME/nakli/crate-agent.pid`, sends SIGTERM, waits for drain). |
 | `crate-agent status` | Process state + queue depth + recent conflicts + capability expiry. `--json` for machine-readable output. |
@@ -130,7 +137,7 @@ Configurable via the TOML — the wizard's defaults work for most users.
 
 - **No bucket credentials on disk.** The daemon holds an encrypted transport capability — a macaroon scoped to your bucket's sync primitive. Losing the daemon leaks the capability (encrypted under your passphrase) but never your R2 access keys.
 - **Passphrase + identity key required to start.** `crate-agent start` decrypts the capability with the passphrase you set at pairing. No passphrase, no daemon. The master key lives only in the daemon process's memory.
-- **Capability refresh, not capability storage.** Capabilities have a 1-year TTL with auto-refresh at 80 %. Stolen capabilities can be revoked from the browser ("Pair an agent" → revoke device).
+- **Capability refresh, not capability storage.** Capabilities have a 1-year TTL with auto-refresh at 80 %. Stolen capabilities can be revoked from the browser ("Pair an agent" → revoke device); a carrier secret is revoked by rotating `CARRIER_SECRET` on the Worker.
 - **AGPL-3.0-or-later.** The whole code path is auditable; transport contract is documented in [`docs/specs/`](docs/specs/) and the [crate-agent wire-protocol audit](docs/wire-protocol-audit.md).
 
 ## Repos
