@@ -4,6 +4,8 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-09-10
+
 ### Added — chunked object framing (v2), matching crate browser `b9c5f87`
 
 - `payload.SealObject` / `payload.OpenObject`: files are sealed as
