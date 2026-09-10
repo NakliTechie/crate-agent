@@ -380,6 +380,25 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 		return nil
 	}
 
+	// Echo guard. The puller lands a remote file by writing a temp file and
+	// renaming it into place; the watcher sees that rename as a local
+	// change and queues a put. If the bytes on disk are exactly what
+	// manifest_cache recorded as last synced for this path (pulled or
+	// pushed), there is nothing to upload — re-encrypting identical bytes
+	// would only add a redundant version to the manifest. Refresh the
+	// cached mtime so the puller's mtime-based conflict check stays quiet.
+	sum := sha256.Sum256(plain)
+	sumHex := hex.EncodeToString(sum[:])
+	if cached, lerr := s.cfg.State.LookupManifestEntry(ctx, row.RemotePath); lerr == nil && cached != nil && cached.UUID != "" && cached.SHA256 == sumHex {
+		cached.LocalMtimeNS = info.ModTime().UnixNano()
+		cached.CachedAt = s.now().UTC()
+		if uerr := s.cfg.State.UpsertManifestEntry(ctx, *cached); uerr != nil {
+			s.logger.Warn("manifest_cache mtime refresh failed", "rel", row.RemotePath, "err", uerr)
+		}
+		s.logger.Info("skipped: bytes unchanged since last sync", "rel", row.RemotePath, "uuid", cached.UUID)
+		return nil
+	}
+
 	cap := s.readCapability()
 	masterKey := *s.cfg.MasterKeyRef
 	if cap == "" || len(masterKey) == 0 {
@@ -524,7 +543,6 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 	}
 
 	// Update local cache.
-	sum := sha256.Sum256(plain)
 	if err := s.cfg.State.UpsertManifestEntry(ctx, state.ManifestEntry{
 		RemotePath:   row.RemotePath,
 		UUID:         uuid,

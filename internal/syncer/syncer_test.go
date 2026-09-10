@@ -3,7 +3,9 @@ package syncer
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -554,5 +556,35 @@ func TestSyncer_UnknownOperation(t *testing.T) {
 func TestExecuteRow_ErrorMessages(t *testing.T) {
 	if !errors.Is(context.Canceled, context.Canceled) {
 		t.Fatal("sanity")
+	}
+}
+
+// A file the puller just landed must not be re-uploaded: manifest_cache
+// already records its bytes as synced. A real edit afterwards must.
+func TestSyncer_NoEchoAfterPull(t *testing.T) {
+	r := setupSyncer(t)
+	plain := []byte("landed by the puller\n")
+	sum := sha256.Sum256(plain)
+	// What the puller writes to manifest_cache right after its rename.
+	if err := r.state.UpsertManifestEntry(context.Background(), state.ManifestEntry{
+		RemotePath: "pulled.txt", UUID: "01PULLEDUUID", ContentIV: "civ",
+		SHA256: hex.EncodeToString(sum[:]), SizeBytes: int64(len(plain)),
+		LastModified: time.Now(), LocalMtimeNS: time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.localPath, "pulled.txt"), plain, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond) // past the watcher debounce + worker tick
+	if n := r.hub.puts.Load(); n != 0 {
+		t.Fatalf("echo: %d PUT(s) for bytes the cache already recorded as synced; hub keys: %v", n, hubKeys(r.hub))
+	}
+	// Now a genuine edit — same path, different bytes — must upload.
+	if err := os.WriteFile(filepath.Join(r.localPath, "pulled.txt"), []byte("edited locally\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(t, 3*time.Second, func() bool { _, ok := r.hub.findObjectsKey(); return ok }) {
+		t.Fatalf("real edit was not uploaded; hub keys: %v", hubKeys(r.hub))
 	}
 }

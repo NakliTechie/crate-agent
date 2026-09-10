@@ -4,6 +4,8 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-10
+
 ### Added — carrier transport (`transport_type = "carrier"`)
 
 - `crate-agent pair --carrier https://<worker>` pairs with a
@@ -33,9 +35,14 @@ DB path is `<local>/.crate/state.db`, inside the watched folder, so a fresh
 pair uploaded `.crate/state.db-wal` as a vault file; the puller's atomic
 temp files were queued the same way. Seen on the carrier walk.
 
-**Known, not fixed here:** after the puller lands a file, the watcher sees
-the rename and the syncer re-uploads the identical bytes once (an echo, one
-extra version per pulled file). Tracked in `plan/pending.md`.
+### Fixed — pulled files were re-uploaded once (echo)
+
+After the puller landed a file, the watcher saw the rename and the syncer
+re-encrypted and re-uploaded identical bytes — one redundant version per
+pulled file. `executePut` now compares the file's SHA-256 with what
+`manifest_cache` recorded as last synced for that path and skips the
+upload when they match, refreshing the cached mtime so the puller's
+conflict check stays quiet. A real edit (different bytes) still uploads.
 
 ## [1.2.0] — 2026-09-10
 
