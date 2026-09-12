@@ -354,3 +354,63 @@ func TestPuller_SkipsIgnoredVaultPaths(t *testing.T) {
 		t.Fatalf("real file not mirrored: %v", err)
 	}
 }
+
+// A re-key re-signs the whole chain, which the anchor sees as a fork at
+// its recorded sig. It is accepted iff the loaded chain carries a higher
+// `rekey` generation; the old chain (generation 0) is then refused, as
+// is a chain that merely claims a higher generation without moving on.
+func TestAnchor_AcceptsRekeyByGeneration(t *testing.T) {
+	r := setupPuller(t)
+	ctx := context.Background()
+	oldKey := make([]byte, 32)
+	newKey := make([]byte, 32)
+	for i := range oldKey {
+		oldKey[i] = byte(i + 1)
+		newKey[i] = byte(200 - i)
+	}
+	mk := func(key []byte, withRekey bool) *manifest.Manifest {
+		m := manifest.New()
+		for _, path := range []string{"/a.txt", "/b.txt"} {
+			if _, err := m.Append(manifest.Event{"op": "mkdir", "path": path + "/"}, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if withRekey {
+			if _, err := m.Append(manifest.Event{"op": "rekey", "generation": float64(1)}, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return m
+	}
+	gen0 := mk(oldKey, false)
+	if ok, why := r.puller.validateAndAdvanceAnchor(ctx, gen0); !ok {
+		t.Fatalf("TOFU should accept: %s", why)
+	}
+	a, _ := r.puller.cfg.State.GetManifestAnchor(ctx, "bk_test")
+	if a.Generation != 0 || a.Count != 2 {
+		t.Fatalf("anchor after TOFU: %+v", a)
+	}
+
+	// re-signed chain under the new key with a rekey event → accepted
+	gen1 := mk(newKey, true)
+	if ok, why := r.puller.validateAndAdvanceAnchor(ctx, gen1); !ok {
+		t.Fatalf("re-keyed chain refused: %s", why)
+	}
+	a, _ = r.puller.cfg.State.GetManifestAnchor(ctx, "bk_test")
+	if a.Generation != 1 || a.Count != 3 {
+		t.Fatalf("anchor after rekey: %+v", a)
+	}
+
+	// the pre-re-key chain (generation 0, shorter, different sig) is now refused
+	if ok, why := r.puller.validateAndAdvanceAnchor(ctx, gen0); ok {
+		t.Fatal("old chain accepted after re-key")
+	} else if why == "" {
+		t.Fatal("expected a reason")
+	}
+	// a same-generation chain that diverges at the anchor point is still a fork
+	fork := mk(newKey, true)
+	fork.Events()[2]["sig"] = "tampered"
+	if ok, _ := r.puller.validateAndAdvanceAnchor(ctx, fork); ok {
+		t.Fatal("same-generation fork accepted")
+	}
+}

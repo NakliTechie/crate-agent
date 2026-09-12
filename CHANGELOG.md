@@ -4,6 +4,10 @@ All notable changes to crate-agent. Format loosely follows [Keep a Changelog](ht
 
 ## [Unreleased]
 
+### Added — re-keyed folders keep syncing
+
+- The manifest rollback anchor records the folder's **re-key generation** (`manifest_anchor.generation`, schema v4, migrated on open). When the browser re-keys a folder (Crate ≥ 1.2, Backup → Re-key folder) the whole chain is re-signed under the new content key, which this daemon used to refuse as a fork; it now accepts the re-signed chain when its `rekey` generation is higher than the anchor's, and re-anchors. The pre-re-key chain (lower generation) is refused, as is any same-generation divergence. On its next start the daemon unwraps the new content key from `passphrase_wrap` as it always has — no re-pair; a daemon running *during* the re-key needs a restart.
+
 ## [1.3.1] — 2026-09-10
 
 ### Fixed

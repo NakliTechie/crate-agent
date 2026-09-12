@@ -568,8 +568,9 @@ func (p *Puller) validateAndAdvanceAnchor(ctx context.Context, fresh *manifest.M
 			"bucket_id", p.cfg.BucketID,
 			"count", loadedCount)
 		if werr := p.cfg.State.SetManifestAnchor(ctx, p.cfg.BucketID, state.ManifestAnchor{
-			Count:   loadedCount,
-			LastSig: loadedLastSig,
+			Count:      loadedCount,
+			LastSig:    loadedLastSig,
+			Generation: manifestGeneration(events),
 		}); werr != nil {
 			// Don't fail the tick — the anchor write is best-effort.
 			// Next tick re-TOFUs at the same or higher count.
@@ -578,6 +579,23 @@ func (p *Puller) validateAndAdvanceAnchor(ctx context.Context, fresh *manifest.M
 		return true, ""
 	}
 
+	// A re-key re-signs the whole chain under the new content key, so the
+	// event at the anchor point carries a new sig — a fork to the rule
+	// below. It is legitimate iff the loaded chain records a HIGHER
+	// generation than the anchor: a bucket-only attacker cannot mint a
+	// `rekey` event (that needs the new key), and replaying the pre-re-key
+	// bucket state brings the old generation back — refused below.
+	loadedGeneration := manifestGeneration(events)
+	if loadedGeneration > prior.Generation {
+		p.logger.Info("manifest re-keyed; re-anchoring",
+			"bucket_id", p.cfg.BucketID, "generation", loadedGeneration, "count", loadedCount)
+		if werr := p.cfg.State.SetManifestAnchor(ctx, p.cfg.BucketID, state.ManifestAnchor{
+			Count: loadedCount, LastSig: loadedLastSig, Generation: loadedGeneration,
+		}); werr != nil {
+			p.logger.Warn("anchor write failed (will retry next tick)", "err", werr)
+		}
+		return true, ""
+	}
 	if loadedCount < prior.Count {
 		return false, fmt.Sprintf("truncation: loaded count %d < anchor count %d",
 			loadedCount, prior.Count)
@@ -594,12 +612,35 @@ func (p *Puller) validateAndAdvanceAnchor(ctx context.Context, fresh *manifest.M
 	}
 	// Advance (or keep) the anchor.
 	if werr := p.cfg.State.SetManifestAnchor(ctx, p.cfg.BucketID, state.ManifestAnchor{
-		Count:   loadedCount,
-		LastSig: loadedLastSig,
+		Count:      loadedCount,
+		LastSig:    loadedLastSig,
+		Generation: loadedGeneration,
 	}); werr != nil {
 		p.logger.Warn("anchor advance failed (will retry next tick)", "err", werr)
 	}
 	return true, ""
+}
+
+// manifestGeneration returns the highest `generation` carried by a
+// `rekey` event in the chain, 0 when the folder was never re-keyed.
+func manifestGeneration(events []map[string]any) int {
+	g := 0
+	for _, e := range events {
+		if op, _ := e["op"].(string); op != "rekey" {
+			continue
+		}
+		switch v := e["generation"].(type) {
+		case float64:
+			if int(v) > g {
+				g = int(v)
+			}
+		case int:
+			if v > g {
+				g = v
+			}
+		}
+	}
+	return g
 }
 
 // --- helpers --------------------------------------------------------------

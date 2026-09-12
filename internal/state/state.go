@@ -2,11 +2,11 @@
 // Package state owns the daemon's local SQLite store. Tables:
 //
 //   - manifest_cache  — local mirror of the cloud manifest (one row per
-//                       remote path; ETag + sha256 + mtime + version).
+//     remote path; ETag + sha256 + mtime + version).
 //   - upload_queue    — pending uploads with retry counters.
 //   - conflict_log    — divergent-write events surfaced in `status`.
 //   - watcher_state   — last-processed FS cursor + pending debounce buffers
-//                       (used to resume on restart without rescanning).
+//     (used to resume on restart without rescanning).
 //
 // Driver: modernc.org/sqlite (pure-Go; no CGO). Single open store per
 // daemon process; migrations applied on open.
@@ -94,6 +94,12 @@ CREATE TABLE manifest_anchor (
     updated_at TEXT NOT NULL
 );
 `,
+	// v4 (crate-agent 1.4.0): the anchor records the manifest's re-key
+	// generation. A re-keyed folder re-signs its whole chain; the puller
+	// accepts that fork only when the generation went up.
+	`
+ALTER TABLE manifest_anchor ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+`,
 }
 
 // Store is the open SQLite connection + a clock for testable timestamps.
@@ -178,10 +184,11 @@ func DefaultPath(crateLocalPath string) string {
 // ManifestEntry is one row in manifest_cache.
 //
 // M3-era fields (added by migration v2):
-//   UUID + ContentIV identify the canonical encrypted version on the
-//   bucket — the (UUID, ContentIV) pair changes whenever the file's
-//   content changes, so the puller compares against these to decide
-//   whether to re-download.
+//
+//	UUID + ContentIV identify the canonical encrypted version on the
+//	bucket — the (UUID, ContentIV) pair changes whenever the file's
+//	content changes, so the puller compares against these to decide
+//	whether to re-download.
 //
 // The older ETag/SHA256 fields are preserved for backward-compat but
 // no longer load-bearing post-M3.
@@ -544,9 +551,10 @@ func (s *Store) GetWatcherState(ctx context.Context, key string) (string, error)
 // ManifestAnchor is the {count, lastSig} pair the puller persists per
 // bucket. Used to refuse manifest rollbacks per the 2026-05 audit's H1.
 type ManifestAnchor struct {
-	Count     int    // event count of the highest-ever-accepted manifest
-	LastSig   string // base64 HMAC of the last event in that manifest
-	UpdatedAt time.Time
+	Count      int    // event count of the highest-ever-accepted manifest
+	LastSig    string // base64 HMAC of the last event in that manifest
+	Generation int    // re-key generation of that manifest (0 = never re-keyed)
+	UpdatedAt  time.Time
 }
 
 // GetManifestAnchor returns the persisted anchor for bucketID, or (nil, nil)
@@ -560,9 +568,9 @@ func (s *Store) GetManifestAnchor(ctx context.Context, bucketID string) (*Manife
 		updatedAt string
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT count, last_sig, updated_at FROM manifest_anchor WHERE bucket_id = ?`,
+		`SELECT count, last_sig, generation, updated_at FROM manifest_anchor WHERE bucket_id = ?`,
 		bucketID,
-	).Scan(&a.Count, &a.LastSig, &updatedAt)
+	).Scan(&a.Count, &a.LastSig, &a.Generation, &updatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -586,13 +594,14 @@ func (s *Store) SetManifestAnchor(ctx context.Context, bucketID string, anchor M
 		anchor.UpdatedAt = s.now().UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `
-        INSERT INTO manifest_anchor (bucket_id, count, last_sig, updated_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO manifest_anchor (bucket_id, count, last_sig, generation, updated_at)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(bucket_id) DO UPDATE SET
             count      = excluded.count,
             last_sig   = excluded.last_sig,
+            generation = excluded.generation,
             updated_at = excluded.updated_at`,
-		bucketID, anchor.Count, anchor.LastSig,
+		bucketID, anchor.Count, anchor.LastSig, anchor.Generation,
 		anchor.UpdatedAt.Format(time.RFC3339Nano),
 	)
 	if err != nil {
