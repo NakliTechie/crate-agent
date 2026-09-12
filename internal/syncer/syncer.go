@@ -464,8 +464,9 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 	}
 	defer payload.Zero(dataKey)
 
-	// Encrypt the payload — v2 chunked framing (payload.SealObject).
-	contentIV, body, err := payload.SealObject(dataKey, plain, uuid, payload.ChunkSize)
+	// Encrypt the payload — v2 chunked framing, deflated first when the
+	// file type is worth it (payload.SealFile; same rule as the browser).
+	contentIV, body, compression, storedSize, err := payload.SealFile(dataKey, plain, uuid, manifestPath, payload.ChunkSize)
 	if err != nil {
 		return fmt.Errorf("seal payload: %w", err)
 	}
@@ -526,17 +527,17 @@ func (s *Syncer) executePut(ctx context.Context, row *state.QueueEntry) error {
 	var evtErr error
 	if !createPath {
 		_, evtErr = s.cfg.ManifestRef.Append(
-			manifest.WithChunkSize(manifest.UpdateEvent(uuid, int64(len(plain)), contentIV), payload.ChunkSize),
+			manifest.WithCompression(manifest.WithChunkSize(manifest.UpdateEvent(uuid, int64(len(plain)), contentIV), payload.ChunkSize), compression, storedSize),
 			masterKey,
 		)
 	} else {
 		_, evtErr = s.cfg.ManifestRef.Append(
-			manifest.WithChunkSize(manifest.CreateEvent(uuid, manifestPath, int64(len(plain)),
+			manifest.WithCompression(manifest.WithChunkSize(manifest.CreateEvent(uuid, manifestPath, int64(len(plain)),
 				mimeFromName(row.RemotePath),
 				decodeB64Must(dataKeyIVB64),
 				decodeB64Must(dataKeyCTB64),
 				contentIV,
-			), payload.ChunkSize),
+			), payload.ChunkSize), compression, storedSize),
 			masterKey,
 		)
 	}

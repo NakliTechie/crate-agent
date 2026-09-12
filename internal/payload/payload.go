@@ -28,6 +28,8 @@
 package payload
 
 import (
+	"bytes"
+	"compress/flate"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -37,7 +39,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"path"
 	"sort"
+	"strings"
 )
 
 const (
@@ -473,4 +478,97 @@ func CanonicalJSON(v interface{}) ([]byte, error) {
 		}
 		return CanonicalJSON(generic)
 	}
+}
+
+// --- compression (Crate 1.2) --------------------------------------------
+// Files that are not already compressed are deflated (raw DEFLATE, what the
+// browser's CompressionStream("deflate-raw") emits) before sealing, when
+// that saves at least 10%. The manifest then carries compression =
+// "deflate-raw" and stored_size (the deflated length the chunk framing
+// covers); size stays the file's real size. Byte-identical contract with
+// lib/crypto.js sealFile / openObject.
+
+const Compression = "deflate-raw"
+
+var skipCompressionExt = map[string]bool{
+	"jpg": true, "jpeg": true, "png": true, "gif": true, "webp": true, "avif": true, "heic": true, "heif": true,
+	"mp3": true, "aac": true, "m4a": true, "ogg": true, "opus": true, "flac": true,
+	"mp4": true, "m4v": true, "mov": true, "webm": true, "mkv": true,
+	"zip": true, "gz": true, "tgz": true, "bz2": true, "xz": true, "zst": true, "7z": true, "rar": true,
+	"pdf": true, "docx": true, "xlsx": true, "pptx": true, "odt": true, "ods": true, "odp": true,
+	"jar": true, "apk": true, "dmg": true, "woff": true, "woff2": true,
+}
+
+// Compressible mirrors the browser's decision: by extension and size only
+// (the daemon has no mime); under 256 bytes is never worth it.
+func Compressible(name string, size int64) bool {
+	if size < 256 {
+		return false
+	}
+	ext := strings.ToLower(strings.TrimPrefix(path.Ext(name), "."))
+	return !skipCompressionExt[ext]
+}
+
+func DeflateRaw(b []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w, err := flate.NewWriter(&buf, flate.DefaultCompression)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.Write(b); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func InflateRaw(b []byte) ([]byte, error) {
+	r := flate.NewReader(bytes.NewReader(b))
+	defer r.Close()
+	return io.ReadAll(r)
+}
+
+// SealFile is SealObject plus the compression decision. Returns
+// (contentIV, body, compression, storedSize); compression is "" when the
+// bytes were stored as-is.
+func SealFile(dataKey, plaintext []byte, uuid, name string, chunkSize int64) ([]byte, []byte, string, int64, error) {
+	if Compressible(name, int64(len(plaintext))) {
+		packed, err := DeflateRaw(plaintext)
+		if err == nil && int64(len(packed))*10 <= int64(len(plaintext))*9 {
+			iv, body, err := SealObject(dataKey, packed, uuid, chunkSize)
+			if err != nil {
+				return nil, nil, "", 0, err
+			}
+			return iv, body, Compression, int64(len(packed)), nil
+		}
+	}
+	iv, body, err := SealObject(dataKey, plaintext, uuid, chunkSize)
+	return iv, body, "", 0, err
+}
+
+// OpenFile is OpenObject plus inflation for a compressed entry. `size` is
+// the file's real size; `storedSize` the deflated length (framing) when
+// compression is set. An unknown compression, a length mismatch, or an
+// inflated size that differs from `size` fail closed.
+func OpenFile(dataKey, body []byte, uuid string, size int64, contentIV []byte, chunkSize int64, compression string, storedSize int64) ([]byte, error) {
+	if compression == "" {
+		return OpenObject(dataKey, body, uuid, size, contentIV, chunkSize)
+	}
+	if compression != Compression {
+		return nil, fmt.Errorf("payload: unknown compression %q", compression)
+	}
+	packed, err := OpenObject(dataKey, body, uuid, storedSize, contentIV, chunkSize)
+	if err != nil {
+		return nil, err
+	}
+	plain, err := InflateRaw(packed)
+	if err != nil {
+		return nil, fmt.Errorf("payload: inflate: %w", err)
+	}
+	if int64(len(plain)) != size {
+		return nil, fmt.Errorf("payload: inflated %d bytes, manifest size %d", len(plain), size)
+	}
+	return plain, nil
 }

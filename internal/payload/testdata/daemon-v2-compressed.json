@@ -1,0 +1,12 @@
+{
+  "producer": "crate-agent internal/payload SealFile (deflate-raw)",
+  "uuid": "01DAEMONFIXTURECOMPRESSED0",
+  "data_key": "X0NtBIEe6iC1JAYQesOOUezX2AfbSG7TBe9PPFyDawE=",
+  "size": 6000,
+  "chunk_size": 1024,
+  "content_iv": "IV46vxtV+bUwVfVY",
+  "compression": "deflate-raw",
+  "stored_size": 77,
+  "body": "IV46vxtV+bUwVfVYA5YUmZabUB/faMMRAkf6VvxpXDnRt9gTRT6ZWZLv2rY17HDAjXSiTi6zT28Ne+NTjd+fusuUuHkRMmPqjo3CGPqmBnQ2wXuW+SAsjKs8MjCfEitbK0qUt0hpNOi4",
+  "plaintext_sha256": "7231a106b253d3a53a4b4a9c6420155dc48a51a1a25d098540a91476a453344d"
+}

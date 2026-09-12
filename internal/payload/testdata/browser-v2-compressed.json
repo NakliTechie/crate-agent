@@ -1,0 +1,12 @@
+{
+  "producer": "crate browser lib/crypto.js sealFile (deflate-raw)",
+  "uuid": "06G9D1ZDYVPY4PNHNQXXS41RK4",
+  "data_key": "6RqRxvLvOSwQhfJnV6/9K4xkuNkOI7ggnpekTy59BuU=",
+  "size": 5280,
+  "chunk_size": 1024,
+  "content_iv": "vx5VfaQqMu07P0k0",
+  "compression": "deflate-raw",
+  "stored_size": 74,
+  "body": "vx5VfaQqMu07P0k0kMIVLPEmhGJgABWUeTPADYLHiEe20e3SFlZAiIpniaouAgtpyEPwPSLaqg2d5zzw0fO8Sm+Nmoyot69KBTp3nPZxFylyY0rXQFWzBJI8debS8n8t320J15W5",
+  "plaintext_sha256": "bd055474aa707e741f6e7d62f1e328b8a60c1c13aedb5268bc13dfd915bec8f3"
+}

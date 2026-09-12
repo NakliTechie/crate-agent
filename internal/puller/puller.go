@@ -392,7 +392,7 @@ func (p *Puller) downloadAndDecrypt(ctx context.Context, entry *manifest.Entry, 
 			return fmt.Errorf("decode content_iv: %w", err)
 		}
 	}
-	plain, err := payload.OpenObject(dataKey, got.Body, entry.UUID, entry.Size, contentIV, entry.ChunkSize)
+	plain, err := payload.OpenFile(dataKey, got.Body, entry.UUID, entry.Size, contentIV, entry.ChunkSize, entry.Compression, entry.StoredSize)
 	if err != nil {
 		return fmt.Errorf("open object: %w", err)
 	}

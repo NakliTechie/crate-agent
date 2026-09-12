@@ -150,16 +150,18 @@ func (m *Manifest) Verify(masterKey []byte) (bool, int, string) {
 
 // Entry is the result of materialise. Folders surface with Path set + IsDir=true.
 type Entry struct {
-	Path      string
-	UUID      string
-	IsDir     bool
-	Size      int64
-	Mime      string
-	DataKeyIV string // base64 (matches browser's data_key_iv)
-	DataKeyCT string // base64
-	ContentIV string // base64
-	ChunkSize int64  // 0 ⇒ v1 single-blob body; >0 ⇒ v2 chunked
-	TSUnixMs  int64
+	Path        string
+	UUID        string
+	IsDir       bool
+	Size        int64
+	Mime        string
+	DataKeyIV   string // base64 (matches browser's data_key_iv)
+	DataKeyCT   string // base64
+	ContentIV   string // base64
+	ChunkSize   int64  // 0 ⇒ v1 single-blob body; >0 ⇒ v2 chunked
+	Compression string // "" ⇒ stored as-is; "deflate-raw" ⇒ inflate after open (Crate 1.2)
+	StoredSize  int64  // deflated length the chunk framing covers, when Compression is set
+	TSUnixMs    int64
 }
 
 // Materialise replays the log into a map keyed by remote path. Folders
@@ -172,15 +174,17 @@ func (m *Manifest) Materialise() map[string]*Entry {
 		switch op {
 		case "create":
 			entry := &Entry{
-				UUID:      strField(e, "uuid"),
-				Path:      strField(e, "path"),
-				Size:      int64Field(e, "size"),
-				Mime:      strField(e, "mime"),
-				DataKeyIV: strField(e, "data_key_iv"),
-				DataKeyCT: strField(e, "data_key_ct"),
-				ContentIV: strField(e, "content_iv"),
-				ChunkSize: int64Field(e, "chunk_size"),
-				TSUnixMs:  int64Field(e, "ts"),
+				UUID:        strField(e, "uuid"),
+				Path:        strField(e, "path"),
+				Size:        int64Field(e, "size"),
+				Mime:        strField(e, "mime"),
+				DataKeyIV:   strField(e, "data_key_iv"),
+				DataKeyCT:   strField(e, "data_key_ct"),
+				ContentIV:   strField(e, "content_iv"),
+				ChunkSize:   int64Field(e, "chunk_size"),
+				Compression: strField(e, "compression"),
+				StoredSize:  int64Field(e, "stored_size"),
+				TSUnixMs:    int64Field(e, "ts"),
 			}
 			byUUID[entry.UUID] = entry
 			byPath[entry.Path] = entry
@@ -194,7 +198,9 @@ func (m *Manifest) Materialise() map[string]*Entry {
 			if iv := strField(e, "content_iv"); iv != "" {
 				entry.ContentIV = iv
 			}
-			entry.ChunkSize = int64Field(e, "chunk_size") // per-version: absent ⇒ v1
+			entry.ChunkSize = int64Field(e, "chunk_size")  // per-version: absent ⇒ v1
+			entry.Compression = strField(e, "compression") // per-version as well
+			entry.StoredSize = int64Field(e, "stored_size")
 			entry.TSUnixMs = int64Field(e, "ts")
 		case "delete":
 			uuid := strField(e, "uuid")
@@ -347,6 +353,17 @@ func UpdateEvent(uuid string, size int64, contentIV []byte) Event {
 func WithChunkSize(evt Event, chunkSize int64) Event {
 	if chunkSize > 0 {
 		evt["chunk_size"] = float64(chunkSize)
+	}
+	return evt
+}
+
+// WithCompression records that the body holds deflated bytes: compression
+// "deflate-raw" and stored_size, the deflated length. Empty compression
+// leaves the event untouched.
+func WithCompression(evt Event, compression string, storedSize int64) Event {
+	if compression != "" {
+		evt["compression"] = compression
+		evt["stored_size"] = float64(storedSize)
 	}
 	return evt
 }

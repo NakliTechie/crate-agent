@@ -2,7 +2,11 @@
 
 All notable changes to crate-agent. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] — 2026-09-12
+
+### Added — compressed objects (Crate 1.2)
+
+- Objects the browser deflated before sealing (`compression: "deflate-raw"`, `stored_size` in the manifest) are inflated on pull; the daemon deflates its own uploads by the same rule (not already-compressed types, ≥ 256 bytes, ≥ 10 % saved), so both surfaces write the same format. `payload.SealFile` / `OpenFile`; cross-surface fixtures in both directions (`testdata/*-compressed.json`). A pre-1.4 daemon fails closed on a compressed object.
 
 ### Added — re-keyed folders keep syncing
 
